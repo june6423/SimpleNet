@@ -64,6 +64,7 @@ def run(
     device = utils.set_torch_device(gpu)
 
     result_collect = []
+    
     for dataloader_count, dataloaders in enumerate(list_of_dataloaders):
         LOGGER.info(
             "Evaluating dataset [{}] ({}/{})...".format(
@@ -82,6 +83,7 @@ def run(
 
         models_dir = os.path.join(run_save_path, "models")
         os.makedirs(models_dir, exist_ok=True)
+        
         for i, SimpleNet in enumerate(simplenet_list):
             # torch.cuda.empty_cache()
             if SimpleNet.backbone.seed is not None:

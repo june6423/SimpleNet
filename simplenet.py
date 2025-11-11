@@ -420,7 +420,6 @@ class SimpleNet(torch.nn.Module):
         for i_mepoch in range(self.meta_epochs):
 
             self._train_discriminator(training_data)
-
             # torch.cuda.empty_cache()
             scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
             auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
@@ -608,7 +607,6 @@ class SimpleNet(torch.nn.Module):
             patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
             features = features.reshape(batchsize, scales[0], scales[1], -1)
             masks, features = self.anomaly_segmentor.convert_to_segmentation(patch_scores, features)
-
         return list(image_scores), list(masks), list(features)
 
     @staticmethod
