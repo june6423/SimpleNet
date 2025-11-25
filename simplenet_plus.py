@@ -144,7 +144,6 @@ class SimpleNet(torch.nn.Module):
         pid = os.getpid()
         def show_mem():
             return(psutil.Process(pid).memory_info())
-
         self.backbone = backbone.to(device)
         self.layers_to_extract_from = layers_to_extract_from
         self.input_shape = input_shape
@@ -309,7 +308,6 @@ class SimpleNet(torch.nn.Module):
 
         ckpt_path = os.path.join(self.ckpt_dir, "models.ckpt")
         if os.path.exists(ckpt_path):
-            breakpoint()
             state_dicts = torch.load(ckpt_path, map_location=self.device)
             if "pretrained_enc" in state_dicts:
                 self.feature_enc.load_state_dict(state_dicts["pretrained_enc"])
@@ -317,7 +315,7 @@ class SimpleNet(torch.nn.Module):
                 self.feature_dec.load_state_dict(state_dicts["pretrained_dec"])
 
         aggregator = {"scores": [], "segmentations": [], "features": []}
-        scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
+        scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
         aggregator["scores"].append(scores)
         aggregator["segmentations"].append(segmentations)
         aggregator["features"].append(features)
@@ -361,18 +359,17 @@ class SimpleNet(torch.nn.Module):
 
         return auroc, full_pixel_auroc
     
-    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt):
+    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies=None):
         
         scores = np.squeeze(np.array(scores))
         img_min_scores = scores.min(axis=-1)
         img_max_scores = scores.max(axis=-1)
         scores = (scores - img_min_scores) / (img_max_scores - img_min_scores)
         # scores = np.mean(scores, axis=0)
-
+        
         auroc = metrics.compute_imagewise_retrieval_metrics(
             scores, labels_gt 
         )["auroc"]
-
         if len(masks_gt) > 0:
             segmentations = np.array(segmentations)
             min_scores = (
@@ -403,6 +400,98 @@ class SimpleNet(torch.nn.Module):
             full_pixel_auroc = -1 
             pro = -1
 
+        if anomalies is not None and len(anomalies) > 0:
+
+            print("\n" + "="*70)
+            print("Class-wise Performance:")
+            print("="*70)
+            print(f"{'Class':<15} {'Count':<8} {'I-AUROC':<10} {'P-AUROC':<10} {'PRO':<10}")
+            print("-"*70)
+            
+            # 고유한 클래스 찾기
+            unique_classes = []
+            for anomaly in anomalies:
+                if anomaly not in unique_classes:
+                    unique_classes.append(anomaly)
+            
+            classwise_results = {}
+            
+            # Normal 데이터 인덱스
+            normal_indices = [i for i, a in enumerate(anomalies) if a == "good"]
+            
+            for class_name in unique_classes:
+                # 해당 클래스 인덱스
+                class_indices = [i for i, a in enumerate(anomalies) if a == class_name]
+                count = len(class_indices)
+                
+                if class_name == "good":
+                    print(f"{class_name:<15} {count:<8} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
+                else:
+                    # Normal + 해당 Anomaly만 사용
+                    combined_indices = normal_indices + class_indices
+                    
+                    # 데이터 추출
+                    class_scores = scores[combined_indices]
+                    class_labels = np.array([labels_gt[i] for i in combined_indices])
+                    
+                    # Image AUROC
+                    class_auroc = metrics.compute_imagewise_retrieval_metrics(
+                        class_scores, class_labels
+                    )["auroc"]
+                    
+                    # Pixel AUROC & PRO
+                    if len(masks_gt) > 0:
+                        class_segmentations = segmentations[combined_indices]
+                        class_masks = [masks_gt[i] for i in combined_indices]
+                        
+                        # Normalization
+                        min_scores = (
+                            class_segmentations.reshape(len(class_segmentations), -1)
+                            .min(axis=-1)
+                            .reshape(-1, 1, 1, 1)
+                        )
+                        max_scores = (
+                            class_segmentations.reshape(len(class_segmentations), -1)
+                            .max(axis=-1)
+                            .reshape(-1, 1, 1, 1)
+                        )
+                        class_norm_segmentations = np.zeros_like(class_segmentations)
+                        for min_score, max_score in zip(min_scores, max_scores):
+                            class_norm_segmentations += (class_segmentations - min_score) / max(max_score - min_score, 1e-2)
+                        class_norm_segmentations = class_norm_segmentations / len(class_scores)
+                        
+                        class_pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
+                            class_norm_segmentations, class_masks
+                        )
+                        class_pixel_auroc = class_pixel_scores["auroc"]
+                        class_pro = metrics.compute_pro(
+                            np.squeeze(np.array(class_masks)), 
+                            class_norm_segmentations
+                        )
+                    else:
+                        class_pixel_auroc = -1
+                        class_pro = -1
+                    
+                    print(f"{class_name:<15} {count:<8} {class_auroc:<10.4f} {class_pixel_auroc:<10.4f} {class_pro:<10.4f}")
+                    
+                    classwise_results[class_name] = {
+                        'image_auroc': class_auroc,
+                        'pixel_auroc': class_pixel_auroc,
+                        'pro': class_pro,
+                        'count': count
+                    }
+        
+            # 평균 (Anomaly classes only)
+            if len(classwise_results) > 0:
+                avg_auroc = np.mean([r['image_auroc'] for r in classwise_results.values()])
+                avg_pixel_auroc = np.mean([r['pixel_auroc'] for r in classwise_results.values() if r['pixel_auroc'] > 0])
+                avg_pro = np.mean([r['pro'] for r in classwise_results.values() if r['pro'] > 0])
+                
+                print("-"*70)
+                print(f"{'Avg (Anomaly)':<15} {'':<8} {avg_auroc:<10.4f} {avg_pixel_auroc:<10.4f} {avg_pro:<10.4f}")
+            
+            print("="*70 + "\n")
+
         return auroc, full_pixel_auroc, pro
         
     
@@ -422,8 +511,8 @@ class SimpleNet(torch.nn.Module):
                 self.load_state_dict(state_dict, strict=False)
 
             self.predict(training_data, "train_")
-            scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
-            auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
+            scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
+            auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies_gt)
             
             return auroc, full_pixel_auroc, anomaly_pixel_auroc
         
@@ -446,8 +535,8 @@ class SimpleNet(torch.nn.Module):
                 self._train_discriminator(training_data, i_mepoch)
 
             # torch.cuda.empty_cache()
-            scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
-            auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
+            scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
+            auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies_gt)
             self.logger.logger.add_scalar("i-auroc", auroc, i_mepoch)
             self.logger.logger.add_scalar("p-auroc", full_pixel_auroc, i_mepoch)
             self.logger.logger.add_scalar("pro", pro, i_mepoch)
@@ -497,7 +586,7 @@ class SimpleNet(torch.nn.Module):
         self.noise_generator.train()
         
         cur_progress = meta_epoch / self.meta_epochs
-        warmup_ratio = 0.3
+        warmup_ratio = 1.0
         transition_ratio = 1.0
         
         mix_ratio = 0.0
@@ -679,33 +768,126 @@ class SimpleNet(torch.nn.Module):
             return self._predict_dataloader(data, prefix)
         return self._predict(data)
 
+    # def _predict_dataloader(self, dataloader, prefix):
+    #     """This function provides anomaly scores/maps for full dataloaders."""
+    #     _ = self.forward_modules.eval()
+
+
+    #     img_paths = []
+    #     scores = []
+    #     masks = []
+    #     features = []
+    #     labels_gt = []
+    #     masks_gt = []
+    #     from sklearn.manifold import TSNE
+
+    #     with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
+    #         for data in data_iterator:
+    #             if isinstance(data, dict):
+    #                 labels_gt.extend(data["is_anomaly"].numpy().tolist())
+    #                 if data.get("mask", None) is not None:
+    #                     masks_gt.extend(data["mask"].numpy().tolist())
+    #                 image = data["image"]
+    #                 img_paths.extend(data['image_path'])
+    #             _scores, _masks, _feats = self._predict(image)
+    #             for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data["is_anomaly"].numpy().tolist()):
+    #                 scores.append(score)
+    #                 masks.append(mask)
+
+    #     return scores, masks, features, labels_gt, masks_gt
+
     def _predict_dataloader(self, dataloader, prefix):
-        """This function provides anomaly scores/maps for full dataloaders."""
+        """
+        [수정됨]
+        전체 데이터로더를 순회하며, 4D(Train) 또는 5D(Test) 텐서를 처리하고
+        결과를 Python list로 집계(aggregate)합니다.
+        """
         _ = self.forward_modules.eval()
 
-
-        img_paths = []
-        scores = []
-        masks = []
-        features = []
-        labels_gt = []
-        masks_gt = []
-        from sklearn.manifold import TSNE
+        # 최종 반환을 위한 빈 리스트 초기화
+        all_scores = []
+        all_masks = []
+        all_features = []
+        all_labels_gt = []
+        all_masks_gt = []
+        all_anomalies = []
 
         with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
             for data in data_iterator:
                 if isinstance(data, dict):
-                    labels_gt.extend(data["is_anomaly"].numpy().tolist())
-                    if data.get("mask", None) is not None:
-                        masks_gt.extend(data["mask"].numpy().tolist())
+                    # Ground truth 정보 추출
+                    labels_gt = data["is_anomaly"].numpy().tolist()
+                    # if data.get("mask", None) is not None:
+                    #     all_masks_gt.extend(data["mask"].numpy().tolist())
                     image = data["image"]
-                    img_paths.extend(data['image_path'])
-                _scores, _masks, _feats = self._predict(image)
-                for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data["is_anomaly"].numpy().tolist()):
-                    scores.append(score)
-                    masks.append(mask)
+                    anomalies = data['anomaly']
+                    # img_paths.extend(data['image_path']) # (필요시 주석 해제)
+                else:
+                    # 데이터가 딕셔너리가 아닌 경우 (예: 단순 텐서)
+                    image = data
+                    labels_gt = []
+                    all_masks_gt = []
+                    anomalies = []
 
-        return scores, masks, features, labels_gt, masks_gt
+                # --- 텐서 차원 분기 (4D vs 5D) ---
+                
+                if image.dim() == 5:
+                    # --- [ETRI TEST 경로] ---
+                    # image.shape == [B, P, C, H, W] (예: [8, 9, 3, 224, 224])
+                    B, P, C, H, W = image.shape
+                    
+                    # 1. 5D 텐서를 4D로 Unroll (Flatten)
+                    # [B, P, C, H, W] -> [B*P, C, H, W] (예: [72, 3, 224, 224])
+                    image = image.view(-1, C, H, W)
+                    
+                    # 2. _predict() 호출
+                    # _predict는 [72, ...] 크기의 Python list들을 반환합니다.
+                    _scores_patches_list, _masks_patches_list, _feats_patches_list = self._predict(image)
+
+                    # [FIX] 3. list를 Tensor로 변환 (오류가 발생했던 지점)
+                    # (device를 명시하여 GPU에서 집계 연산 수행)
+                    _scores_patches_tensor = torch.tensor(np.array(_scores_patches_list), device=self.device)
+                    _masks_patches_tensor = torch.tensor(np.array(_masks_patches_list), device=self.device)
+                    _feats_patches_tensor = torch.tensor(np.array(_feats_patches_list), device=self.device)
+
+                    # 4. I-AUROC Roll-up (Aggregation)
+                    # [72] -> [B, P] (예: [8, 9])
+                    _scores_patches_tensor = _scores_patches_tensor.view(B, P)
+                    # "9개 중 하나라도 wrong이면" -> max() 연산
+                    # [B, P] -> [B] (예: [8])
+                    _scores_tensor, _ = torch.max(_scores_patches_tensor, dim=1)
+                    
+                    # 5. P-AUROC(마스크) Roll-up
+                    # [72, H, W] -> [B, P, H, W]
+                    _masks_tensor = _masks_patches_tensor.view(B, P, H, W)
+                    # [B, P, H, W] -> [B, H, W] (9개 패치 중 max score)
+                    _masks_tensor, _ = torch.max(_masks_tensor, dim=1)
+                    
+                    # 6. 피처 Roll-up (첫 번째 패치만 대표로 저장)
+                    _feats_tensor = _feats_patches_tensor.view(B, P, -1)
+                    _feats_tensor = _feats_tensor[:, 0, :] # [B, C_feat]
+                    
+                    # 7. 최종 집계 리스트에 추가하기 위해 CPU/list로 변환
+                    _scores = _scores_tensor.cpu().numpy().tolist()
+                    _masks = _masks_tensor.cpu().numpy().tolist()
+                    _feats = _feats_tensor.cpu().numpy().tolist()
+
+                else:
+                    # --- [MVTec / ETRI TRAIN 경로] ---
+                    # image.shape == [B, C, H, W] (예: [64, 3, 224, 224])
+                    # _predict는 [B] 크기의 list들을 반환
+                    _scores, _masks, _feats = self._predict(image)
+
+                # --- [공통] 집계 ---
+                # _scores, _masks, _feats는 4D/5D 경로 모두에서 Python list 상태임
+                all_scores.extend(_scores)
+                #all_masks.extend(_masks)
+                #all_features.extend(_feats)
+                all_labels_gt.extend(labels_gt if isinstance(labels_gt, list) else [labels_gt])
+                all_anomalies.extend(anomalies if isinstance(anomalies, list) else [anomalies])
+
+        # _predict_dataloader의 최종 반환 (list 형태)
+        return all_scores, all_masks, all_features, all_labels_gt, all_masks_gt, all_anomalies
 
     def _predict(self, images):
         """Infer score and mask for a batch of images."""

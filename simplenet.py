@@ -21,6 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 import common
 import metrics
 from utils import plot_segmentation_images
+import wandb
 
 LOGGER = logging.getLogger(__name__)
 
@@ -297,7 +298,7 @@ class SimpleNet(torch.nn.Module):
                 self.feature_dec.load_state_dict(state_dicts["pretrained_dec"])
 
         aggregator = {"scores": [], "segmentations": [], "features": []}
-        scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
+        scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
         aggregator["scores"].append(scores)
         aggregator["segmentations"].append(segmentations)
         aggregator["features"].append(features)
@@ -341,7 +342,7 @@ class SimpleNet(torch.nn.Module):
 
         return auroc, full_pixel_auroc
     
-    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt):
+    def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies=None):
         
         scores = np.squeeze(np.array(scores))
         img_min_scores = scores.min(axis=-1)
@@ -383,6 +384,98 @@ class SimpleNet(torch.nn.Module):
             full_pixel_auroc = -1 
             pro = -1
 
+        if anomalies is not None and len(anomalies) > 0:
+
+            print("\n" + "="*70)
+            print("Class-wise Performance:")
+            print("="*70)
+            print(f"{'Class':<15} {'Count':<8} {'I-AUROC':<10} {'P-AUROC':<10} {'PRO':<10}")
+            print("-"*70)
+            
+            # 고유한 클래스 찾기
+            unique_classes = []
+            for anomaly in anomalies:
+                if anomaly not in unique_classes:
+                    unique_classes.append(anomaly)
+            
+            classwise_results = {}
+            
+            # Normal 데이터 인덱스
+            normal_indices = [i for i, a in enumerate(anomalies) if a == "good"]
+            
+            for class_name in unique_classes:
+                # 해당 클래스 인덱스
+                class_indices = [i for i, a in enumerate(anomalies) if a == class_name]
+                count = len(class_indices)
+                
+                if class_name == "good":
+                    print(f"{class_name:<15} {count:<8} {'N/A':<10} {'N/A':<10} {'N/A':<10}")
+                else:
+                    # Normal + 해당 Anomaly만 사용
+                    combined_indices = normal_indices + class_indices
+                    
+                    # 데이터 추출
+                    class_scores = scores[combined_indices]
+                    class_labels = np.array([labels_gt[i] for i in combined_indices])
+                    
+                    # Image AUROC
+                    class_auroc = metrics.compute_imagewise_retrieval_metrics(
+                        class_scores, class_labels
+                    )["auroc"]
+                    
+                    # Pixel AUROC & PRO
+                    if len(masks_gt) > 0:
+                        class_segmentations = segmentations[combined_indices]
+                        class_masks = [masks_gt[i] for i in combined_indices]
+                        
+                        # Normalization
+                        min_scores = (
+                            class_segmentations.reshape(len(class_segmentations), -1)
+                            .min(axis=-1)
+                            .reshape(-1, 1, 1, 1)
+                        )
+                        max_scores = (
+                            class_segmentations.reshape(len(class_segmentations), -1)
+                            .max(axis=-1)
+                            .reshape(-1, 1, 1, 1)
+                        )
+                        class_norm_segmentations = np.zeros_like(class_segmentations)
+                        for min_score, max_score in zip(min_scores, max_scores):
+                            class_norm_segmentations += (class_segmentations - min_score) / max(max_score - min_score, 1e-2)
+                        class_norm_segmentations = class_norm_segmentations / len(class_scores)
+                        
+                        class_pixel_scores = metrics.compute_pixelwise_retrieval_metrics(
+                            class_norm_segmentations, class_masks
+                        )
+                        class_pixel_auroc = class_pixel_scores["auroc"]
+                        class_pro = metrics.compute_pro(
+                            np.squeeze(np.array(class_masks)), 
+                            class_norm_segmentations
+                        )
+                    else:
+                        class_pixel_auroc = -1
+                        class_pro = -1
+                    
+                    print(f"{class_name:<15} {count:<8} {class_auroc:<10.4f} {class_pixel_auroc:<10.4f} {class_pro:<10.4f}")
+                    
+                    classwise_results[class_name] = {
+                        'image_auroc': class_auroc,
+                        'pixel_auroc': class_pixel_auroc,
+                        'pro': class_pro,
+                        'count': count
+                    }
+        
+            # 평균 (Anomaly classes only)
+            if len(classwise_results) > 0:
+                avg_auroc = np.mean([r['image_auroc'] for r in classwise_results.values()])
+                avg_pixel_auroc = np.mean([r['pixel_auroc'] for r in classwise_results.values() if r['pixel_auroc'] > 0])
+                avg_pro = np.mean([r['pro'] for r in classwise_results.values() if r['pro'] > 0])
+                
+                print("-"*70)
+                print(f"{'Avg (Anomaly)':<15} {'':<8} {avg_auroc:<10.4f} {avg_pixel_auroc:<10.4f} {avg_pro:<10.4f}")
+            
+            print("="*70 + "\n")
+
         return auroc, full_pixel_auroc, pro
         
     
@@ -401,8 +494,8 @@ class SimpleNet(torch.nn.Module):
                 self.load_state_dict(state_dict, strict=False)
 
             self.predict(training_data, "train_")
-            scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
-            auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
+            scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
+            auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies_gt)
             
             return auroc, full_pixel_auroc, anomaly_pixel_auroc
         
@@ -421,8 +514,8 @@ class SimpleNet(torch.nn.Module):
 
             self._train_discriminator(training_data)
             # torch.cuda.empty_cache()
-            scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
-            auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
+            scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
+            auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies_gt)
             self.logger.logger.add_scalar("i-auroc", auroc, i_mepoch)
             self.logger.logger.add_scalar("p-auroc", full_pixel_auroc, i_mepoch)
             self.logger.logger.add_scalar("pro", pro, i_mepoch)
@@ -446,10 +539,113 @@ class SimpleNet(torch.nn.Module):
                   f"  P-AUROC{round(full_pixel_auroc, 4)}(MAX:{round(best_record[1], 4)}) -----"
                   f"  PRO-AUROC{round(pro, 4)}(MAX:{round(best_record[2], 4)}) -----")
         
+            wandb.log({
+                "meta_epoch"   : i_mepoch,
+                "I-AUROC": auroc,
+                "P-AUROC": full_pixel_auroc,
+                "PRO-AUROC": pro
+            })
+
         torch.save(state_dict, ckpt_path)
         
         return best_record
             
+
+    # def _train_discriminator(self, input_data):
+    #     """Computes and sets the support features for SPADE."""
+    #     _ = self.forward_modules.eval()
+        
+    #     if self.pre_proj > 0:
+    #         self.pre_projection.train()
+    #     self.discriminator.train()
+    #     # self.feature_enc.eval()
+    #     # self.feature_dec.eval()
+    #     i_iter = 0
+    #     LOGGER.info(f"Training discriminator...")
+    #     with tqdm.tqdm(total=self.gan_epochs) as pbar:
+    #         for i_epoch in range(self.gan_epochs):
+    #             all_loss = []
+    #             all_p_true = []
+    #             all_p_fake = []
+    #             all_p_interp = []
+    #             embeddings_list = []
+    #             for data_item in input_data:
+    #                 self.dsc_opt.zero_grad()
+    #                 if self.pre_proj > 0:
+    #                     self.proj_opt.zero_grad()
+    #                 # self.dec_opt.zero_grad()
+
+    #                 i_iter += 1
+    #                 img = data_item["image"]
+    #                 img = img.to(torch.float).to(self.device)
+    #                 if self.pre_proj > 0:
+    #                     true_feats = self.pre_projection(self._embed(img, evaluation=False)[0])
+    #                 else:
+    #                     true_feats = self._embed(img, evaluation=False)[0]
+                    
+    #                 noise_idxs = torch.randint(0, self.mix_noise, torch.Size([true_feats.shape[0]]))
+    #                 noise_one_hot = torch.nn.functional.one_hot(noise_idxs, num_classes=self.mix_noise).to(self.device) # (N, K)
+    #                 noise = torch.stack([
+    #                     torch.normal(0, self.noise_std * 1.1**(k), true_feats.shape)
+    #                     for k in range(self.mix_noise)], dim=1).to(self.device) # (N, K, C)
+    #                 noise = (noise * noise_one_hot.unsqueeze(-1)).sum(1)
+    #                 fake_feats = true_feats + noise
+
+    #                 scores = self.discriminator(torch.cat([true_feats, fake_feats]))
+    #                 true_scores = scores[:len(true_feats)]
+    #                 fake_scores = scores[len(fake_feats):]
+                    
+    #                 th = self.dsc_margin
+    #                 p_true = (true_scores.detach() >= th).sum() / len(true_scores)
+    #                 p_fake = (fake_scores.detach() < -th).sum() / len(fake_scores)
+    #                 true_loss = torch.clip(-true_scores + th, min=0)
+    #                 fake_loss = torch.clip(fake_scores + th, min=0)
+
+    #                 self.logger.logger.add_scalar(f"p_true", p_true, self.logger.g_iter)
+    #                 self.logger.logger.add_scalar(f"p_fake", p_fake, self.logger.g_iter)
+
+    #                 loss = true_loss.mean() + fake_loss.mean()
+    #                 self.logger.logger.add_scalar("loss", loss, self.logger.g_iter)
+    #                 self.logger.step()
+
+    #                 loss.backward()
+    #                 if self.pre_proj > 0:
+    #                     self.proj_opt.step()
+    #                 if self.train_backbone:
+    #                     self.backbone_opt.step()
+    #                 self.dsc_opt.step()
+
+    #                 loss = loss.detach().cpu() 
+    #                 all_loss.append(loss.item())
+    #                 all_p_true.append(p_true.cpu().item())
+    #                 all_p_fake.append(p_fake.cpu().item())
+                    
+    #                 loss_dict = {
+    #                     "loss": loss.item(),
+    #                     "p_true": p_true.item(),
+    #                     "p_fake": p_fake.item(),
+    #                 }
+                                     
+    #                 wandb.log(loss_dict, step=self.logger.g_iter)
+                
+                
+    #             if len(embeddings_list) > 0:
+    #                 self.auto_noise[1] = torch.cat(embeddings_list).std(0).mean(-1)
+                
+    #             if self.cos_lr:
+    #                 self.dsc_schl.step()
+                
+    #             all_loss = sum(all_loss) / len(input_data)
+    #             all_p_true = sum(all_p_true) / len(input_data)
+    #             all_p_fake = sum(all_p_fake) / len(input_data)
+    #             cur_lr = self.dsc_opt.state_dict()['param_groups'][0]['lr']
+    #             pbar_str = f"epoch:{i_epoch} loss:{round(all_loss, 5)} "
+    #             pbar_str += f"lr:{round(cur_lr, 6)}"
+    #             pbar_str += f" p_true:{round(all_p_true, 3)} p_fake:{round(all_p_fake, 3)}"
+    #             if len(all_p_interp) > 0:
+    #                 pbar_str += f" p_interp:{round(sum(all_p_interp) / len(input_data), 3)}"
+    #             pbar.set_description_str(pbar_str)
+    #             pbar.update(1)
 
     def _train_discriminator(self, input_data):
         """Computes and sets the support features for SPADE."""
@@ -458,10 +654,10 @@ class SimpleNet(torch.nn.Module):
         if self.pre_proj > 0:
             self.pre_projection.train()
         self.discriminator.train()
-        # self.feature_enc.eval()
-        # self.feature_dec.eval()
+        
         i_iter = 0
         LOGGER.info(f"Training discriminator...")
+        
         with tqdm.tqdm(total=self.gan_epochs) as pbar:
             for i_epoch in range(self.gan_epochs):
                 all_loss = []
@@ -469,15 +665,16 @@ class SimpleNet(torch.nn.Module):
                 all_p_fake = []
                 all_p_interp = []
                 embeddings_list = []
+                
                 for data_item in input_data:
                     self.dsc_opt.zero_grad()
                     if self.pre_proj > 0:
                         self.proj_opt.zero_grad()
-                    # self.dec_opt.zero_grad()
-
+                    
                     i_iter += 1
                     img = data_item["image"]
                     img = img.to(torch.float).to(self.device)
+                    
                     if self.pre_proj > 0:
                         true_feats = self.pre_projection(self._embed(img, evaluation=False)[0])
                     else:
@@ -507,21 +704,30 @@ class SimpleNet(torch.nn.Module):
                     loss = true_loss.mean() + fake_loss.mean()
                     self.logger.logger.add_scalar("loss", loss, self.logger.g_iter)
                     self.logger.step()
-
+                    
+                    # ... (noise 생성 및 loss 계산 코드)
+                    
                     loss.backward()
                     if self.pre_proj > 0:
                         self.proj_opt.step()
                     if self.train_backbone:
                         self.backbone_opt.step()
                     self.dsc_opt.step()
-
-                    loss = loss.detach().cpu() 
-                    all_loss.append(loss.item())
+                    
+                    # [추가] 매 배치마다 메모리 정리
+                    loss_item = loss.detach().cpu().item()
+                    all_loss.append(loss_item)
                     all_p_true.append(p_true.cpu().item())
                     all_p_fake.append(p_fake.cpu().item())
-                
-                if len(embeddings_list) > 0:
-                    self.auto_noise[1] = torch.cat(embeddings_list).std(0).mean(-1)
+                    
+                    # [중요] GPU 텐서 명시적 삭제
+                    del img, true_feats, fake_feats, noise, scores, true_scores, fake_scores
+                    del true_loss, fake_loss, loss
+                    
+                # [추가] Epoch 끝날 때마다 메모리 정리
+                if embeddings_list:
+                    del embeddings_list
+                torch.cuda.empty_cache()
                 
                 if self.cos_lr:
                     self.dsc_schl.step()
@@ -544,33 +750,211 @@ class SimpleNet(torch.nn.Module):
             return self._predict_dataloader(data, prefix)
         return self._predict(data)
 
+    # def _predict_dataloader(self, dataloader, prefix):
+    #     """This function provides anomaly scores/maps for full dataloaders."""
+    #     _ = self.forward_modules.eval()
+
+
+    #     img_paths = []
+    #     scores = []
+    #     masks = []
+    #     features = []
+    #     labels_gt = []
+    #     masks_gt = []
+    #     from sklearn.manifold import TSNE
+
+    #     with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
+    #         for data in data_iterator:
+    #             if isinstance(data, dict):
+    #                 labels_gt.extend(data["is_anomaly"].numpy().tolist())
+    #                 if data.get("mask", None) is not None:
+    #                     masks_gt.extend(data["mask"].numpy().tolist())
+    #                 image = data["image"]
+    #                 img_paths.extend(data['image_path'])
+    #             _scores, _masks, _feats = self._predict(image)
+    #             for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data["is_anomaly"].numpy().tolist()):
+    #                 scores.append(score)
+    #                 masks.append(mask)
+
+    #     return scores, masks, features, labels_gt, masks_gt
+
+    # def _predict_dataloader(self, dataloader, prefix):
+    #     """
+    #     [수정됨]
+    #     전체 데이터로더를 순회하며, 4D(Train) 또는 5D(Test) 텐서를 처리하고
+    #     결과를 Python list로 집계(aggregate)합니다.
+    #     """
+    #     _ = self.forward_modules.eval()
+
+    #     # 최종 반환을 위한 빈 리스트 초기화
+    #     all_scores = []
+    #     all_masks = []
+    #     all_features = []
+    #     all_labels_gt = []
+    #     all_masks_gt = []
+    #     all_anomalies = []
+
+    #     with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
+    #         for data in data_iterator:
+    #             if isinstance(data, dict):
+    #                 # Ground truth 정보 추출
+    #                 labels_gt = data["is_anomaly"].numpy().tolist()
+    #                 # if data.get("mask", None) is not None:
+    #                 #     all_masks_gt.extend(data["mask"].numpy().tolist())
+    #                 image = data["image"]
+    #                 anomalies = data['anomaly']
+    #                 # img_paths.extend(data['image_path']) # (필요시 주석 해제)
+    #             else:
+    #                 # 데이터가 딕셔너리가 아닌 경우 (예: 단순 텐서)
+    #                 image = data
+    #                 labels_gt = []
+    #                 all_masks_gt = []
+    #                 anomalies = []
+
+    #             # --- 텐서 차원 분기 (4D vs 5D) ---
+                
+    #             if image.dim() == 5:
+    #                 # --- [ETRI TEST 경로] ---
+    #                 # image.shape == [B, P, C, H, W] (예: [8, 9, 3, 224, 224])
+    #                 B, P, C, H, W = image.shape
+                    
+    #                 # 1. 5D 텐서를 4D로 Unroll (Flatten)
+    #                 # [B, P, C, H, W] -> [B*P, C, H, W] (예: [72, 3, 224, 224])
+    #                 image = image.view(-1, C, H, W)
+                    
+    #                 # 2. _predict() 호출
+    #                 # _predict는 [72, ...] 크기의 Python list들을 반환합니다.
+    #                 _scores_patches_list, _masks_patches_list, _feats_patches_list = self._predict(image)
+
+    #                 # [FIX] 3. list를 Tensor로 변환 (오류가 발생했던 지점)
+    #                 # (device를 명시하여 GPU에서 집계 연산 수행)
+    #                 _scores_patches_tensor = torch.tensor(np.array(_scores_patches_list), device=self.device)
+    #                 _masks_patches_tensor = torch.tensor(np.array(_masks_patches_list), device=self.device)
+    #                 _feats_patches_tensor = torch.tensor(np.array(_feats_patches_list), device=self.device)
+
+    #                 # 4. I-AUROC Roll-up (Aggregation)
+    #                 # [72] -> [B, P] (예: [8, 9])
+    #                 _scores_patches_tensor = _scores_patches_tensor.view(B, P)
+    #                 # "9개 중 하나라도 wrong이면" -> max() 연산
+    #                 # [B, P] -> [B] (예: [8])
+    #                 _scores_tensor, _ = torch.max(_scores_patches_tensor, dim=1)
+                    
+    #                 # 5. P-AUROC(마스크) Roll-up
+    #                 # [72, H, W] -> [B, P, H, W]
+    #                 _masks_tensor = _masks_patches_tensor.view(B, P, H, W)
+    #                 # [B, P, H, W] -> [B, H, W] (9개 패치 중 max score)
+    #                 _masks_tensor, _ = torch.max(_masks_tensor, dim=1)
+                    
+    #                 # 6. 피처 Roll-up (첫 번째 패치만 대표로 저장)
+    #                 _feats_tensor = _feats_patches_tensor.view(B, P, -1)
+    #                 _feats_tensor = _feats_tensor[:, 0, :] # [B, C_feat]
+                    
+    #                 # 7. 최종 집계 리스트에 추가하기 위해 CPU/list로 변환
+    #                 _scores = _scores_tensor.cpu().numpy().tolist()
+    #                 _masks = _masks_tensor.cpu().numpy().tolist()
+    #                 _feats = _feats_tensor.cpu().numpy().tolist()
+
+    #             else:
+    #                 # --- [MVTec / ETRI TRAIN 경로] ---
+    #                 # image.shape == [B, C, H, W] (예: [64, 3, 224, 224])
+    #                 # _predict는 [B] 크기의 list들을 반환
+    #                 _scores, _masks, _feats = self._predict(image)
+
+    #             # --- [공통] 집계 ---
+    #             # _scores, _masks, _feats는 4D/5D 경로 모두에서 Python list 상태임
+    #             all_scores.extend(_scores)
+    #             #all_masks.extend(_masks)
+    #             #all_features.extend(_feats)
+    #             all_labels_gt.extend(labels_gt if isinstance(labels_gt, list) else [labels_gt])
+    #             all_anomalies.extend(anomalies if isinstance(anomalies, list) else [anomalies])
+
+    #     # _predict_dataloader의 최종 반환 (list 형태)
+    #     return all_scores, all_masks, all_features, all_labels_gt, all_masks_gt, all_anomalies
+
     def _predict_dataloader(self, dataloader, prefix):
-        """This function provides anomaly scores/maps for full dataloaders."""
+        """
+        [메모리 누수 수정 버전]
+        전체 데이터로더를 순회하며, 4D(Train) 또는 5D(Test) 텐서를 처리하고
+        결과를 Python list로 집계(aggregate)합니다.
+        """
         _ = self.forward_modules.eval()
-
-
-        img_paths = []
-        scores = []
-        masks = []
-        features = []
-        labels_gt = []
-        masks_gt = []
-        from sklearn.manifold import TSNE
-
+        
+        # 최종 반환을 위한 빈 리스트 초기화
+        all_scores = []
+        all_masks = []
+        all_features = []
+        all_labels_gt = []
+        all_masks_gt = []
+        all_anomalies = []
+        
         with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
             for data in data_iterator:
                 if isinstance(data, dict):
-                    labels_gt.extend(data["is_anomaly"].numpy().tolist())
-                    if data.get("mask", None) is not None:
-                        masks_gt.extend(data["mask"].numpy().tolist())
+                    # Ground truth 정보 추출
+                    labels_gt = data["is_anomaly"].numpy().tolist()
                     image = data["image"]
-                    img_paths.extend(data['image_path'])
-                _scores, _masks, _feats = self._predict(image)
-                for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data["is_anomaly"].numpy().tolist()):
-                    scores.append(score)
-                    masks.append(mask)
+                    anomalies = data['anomaly']
+                else:
+                    image = data
+                    labels_gt = []
+                    all_masks_gt = []
+                    anomalies = []
+                
+                # --- 텐서 차원 분기 (4D vs 5D) ---
+                if image.dim() == 5:
+                    # --- [ETRI TEST 경로] ---
+                    B, P, C, H, W = image.shape
+                    
+                    # 1. 5D 텐서를 4D로 Unroll
+                    image = image.view(-1, C, H, W)
+                    
+                    # 2. _predict() 호출
+                    _scores_patches_list, _masks_patches_list, _feats_patches_list = self._predict(image)
+                    
+                    # [수정] 3. NumPy 배열로 직접 변환 (중간 복사 최소화)
+                    _scores_patches = np.array(_scores_patches_list, dtype=np.float32)
+                    _masks_patches = np.array(_masks_patches_list, dtype=np.float32)
+                    _feats_patches = np.array(_feats_patches_list, dtype=np.float32)
+                    
+                    # [수정] 4. NumPy에서 직접 reshape 및 max 연산 (GPU 메모리 절약)
+                    # I-AUROC Roll-up
+                    _scores_patches = _scores_patches.reshape(B, P)
+                    _scores = np.max(_scores_patches, axis=1).tolist()  # [B]
+                    
+                    # P-AUROC(마스크) Roll-up
+                    _masks_patches = _masks_patches.reshape(B, P, H, W)
+                    _masks = np.max(_masks_patches, axis=1).tolist()  # [B, H, W]
+                    
+                    # 피처 Roll-up (첫 번째 패치만)
+                    _feats_patches = _feats_patches.reshape(B, P, -1)
+                    _feats = _feats_patches[:, 0, :].tolist()  # [B, C_feat]
+                    
+                    # [중요] 메모리 해제
+                    del _scores_patches, _masks_patches, _feats_patches
+                    del _scores_patches_list, _masks_patches_list, _feats_patches_list
+                    
+                else:
+                    # --- [MVTec / ETRI TRAIN 경로] ---
+                    _scores, _masks, _feats = self._predict(image)
+                
+                # --- [공통] 집계 ---
+                all_scores.extend(_scores)
+                # all_masks.extend(_masks)  # 필요 시 주석 해제
+                # all_features.extend(_feats)  # 필요 시 주석 해제
+                all_labels_gt.extend(labels_gt if isinstance(labels_gt, list) else [labels_gt])
+                all_anomalies.extend(anomalies if isinstance(anomalies, list) else [anomalies])
+                
+                # [중요] 각 배치 후 메모리 정리
+                del image, _scores, _masks, _feats
+                if data.get("image", None) is not None:
+                    del data
+        
+        # [중요] 마지막 메모리 정리
+        torch.cuda.empty_cache()
+        
+        return all_scores, all_masks, all_features, all_labels_gt, all_masks_gt, all_anomalies
 
-        return scores, masks, features, labels_gt, masks_gt
+
 
     def _predict(self, images):
         """Infer score and mask for a batch of images."""

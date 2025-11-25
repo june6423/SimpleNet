@@ -17,7 +17,8 @@ sys.path.append("src")
 import backbones
 import common
 import metrics
-import simplenet_plus
+#import simplenet_plus
+import simplenet
 import utils
 import wandb
 
@@ -25,6 +26,8 @@ LOGGER = logging.getLogger(__name__)
 
 _DATASETS = {
     "mvtec": ["datasets.mvtec", "MVTecDataset"],
+    "etri": ["datasets.etri", "EtriDataset"],
+    "etri_printing": ["datasets.etri_printing", "EtriPrintingDataset"],
 }
 
 
@@ -202,7 +205,8 @@ def net(
             backbone = backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
-            simplenet_inst = simplenet_plus.SimpleNet(device)
+            simplenet_inst = simplenet.SimpleNet(device)
+            #simplenet_inst = simplenet_plus.SimpleNet(device)
             simplenet_inst.load(
                 backbone=backbone,
                 layers_to_extract_from=layers_to_extract_from,
@@ -320,7 +324,7 @@ def dataset(
 
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset,
-                batch_size=batch_size,
+                batch_size=1,
                 shuffle=False,
                 num_workers=num_workers,
                 prefetch_factor=2,
