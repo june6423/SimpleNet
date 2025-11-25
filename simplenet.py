@@ -705,8 +705,6 @@ class SimpleNet(torch.nn.Module):
                     self.logger.logger.add_scalar("loss", loss, self.logger.g_iter)
                     self.logger.step()
                     
-                    # ... (noise 생성 및 loss 계산 코드)
-                    
                     loss.backward()
                     if self.pre_proj > 0:
                         self.proj_opt.step()
@@ -714,17 +712,16 @@ class SimpleNet(torch.nn.Module):
                         self.backbone_opt.step()
                     self.dsc_opt.step()
                     
-                    # [추가] 매 배치마다 메모리 정리
+                    # 매 배치마다 메모리 정리
                     loss_item = loss.detach().cpu().item()
                     all_loss.append(loss_item)
                     all_p_true.append(p_true.cpu().item())
                     all_p_fake.append(p_fake.cpu().item())
                     
-                    # [중요] GPU 텐서 명시적 삭제
                     del img, true_feats, fake_feats, noise, scores, true_scores, fake_scores
                     del true_loss, fake_loss, loss
                     
-                # [추가] Epoch 끝날 때마다 메모리 정리
+                #  Epoch 끝날 때마다 메모리 정리
                 if embeddings_list:
                     del embeddings_list
                 torch.cuda.empty_cache()

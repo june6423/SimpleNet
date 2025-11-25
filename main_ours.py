@@ -17,8 +17,7 @@ sys.path.append("src")
 import backbones
 import common
 import metrics
-#import simplenet_plus
-import simplenet
+import simplenet_plus
 import utils
 import wandb
 
@@ -205,8 +204,8 @@ def net(
             backbone = backbones.load(backbone_name)
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
-            simplenet_inst = simplenet.SimpleNet(device)
-            #simplenet_inst = simplenet_plus.SimpleNet(device)
+            # simplenet_inst = simplenet.SimpleNet(device)
+            simplenet_inst = simplenet_plus.SimpleNet(device)
             simplenet_inst.load(
                 backbone=backbone,
                 layers_to_extract_from=layers_to_extract_from,

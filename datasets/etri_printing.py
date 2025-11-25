@@ -137,9 +137,6 @@ class EtriPrintingDataset(MVTecDataset):
             print(f"Loaded {count} training images from 11/normal")
         
         else:
-            # Test: 10/normal의 10% + 모든 flaw 폴더
-            
-            # 1. 10/normal의 10% 샘플링
             test_normal_path = os.path.join(self.source, "10", "normal")
             if os.path.exists(test_normal_path):
                 normal_files = sorted([
@@ -147,7 +144,6 @@ class EtriPrintingDataset(MVTecDataset):
                     if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
                 ])
                 
-                # 10% 샘플링 (랜덤하지만 재현 가능하도록 seed 고정)
                 random.seed(42)
                 num_samples = max(1, int(len(normal_files) * self.test_normal_ratio))
                 sampled_files = random.sample(normal_files, num_samples)
@@ -160,7 +156,7 @@ class EtriPrintingDataset(MVTecDataset):
             else:
                 print(f"Warning: 10/normal path not found: {test_normal_path}")
             
-            # 2. 모든 폴더의 flaw 데이터 로드 (단일 클래스로 처리)
+            # 모든 폴더의 flaw 데이터 로드 (단일 클래스로 처리)
             total_flaw_count = 0
             
             for folder_num in _FOLDER_NUMBERS:

@@ -586,8 +586,8 @@ class SimpleNet(torch.nn.Module):
         self.noise_generator.train()
         
         cur_progress = meta_epoch / self.meta_epochs
-        warmup_ratio = 1.0
-        transition_ratio = 1.0
+        warmup_ratio = 0.25
+        transition_ratio = 0.75
         
         mix_ratio = 0.0
         if cur_progress >= warmup_ratio and cur_progress < (warmup_ratio + transition_ratio):

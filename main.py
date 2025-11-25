@@ -17,13 +17,17 @@ sys.path.append("src")
 import backbones
 import common
 import metrics
-import simplenet 
+#import simplenet_plus
+import simplenet
 import utils
+import wandb
 
 LOGGER = logging.getLogger(__name__)
 
 _DATASETS = {
     "mvtec": ["datasets.mvtec", "MVTecDataset"],
+    "etri": ["datasets.etri", "EtriDataset"],
+    "etri_printing": ["datasets.etri_printing", "EtriPrintingDataset"],
 }
 
 
@@ -92,6 +96,13 @@ def run(
                 "Training models ({}/{})".format(i + 1, len(simplenet_list))
             )
             # torch.cuda.empty_cache()
+            
+            wandb.init(
+                project=log_project,
+                group=log_group,
+                name=dataset_name+"_directKD",
+                reinit=True
+            )
 
             SimpleNet.set_model_dir(os.path.join(models_dir, f"{i}"), dataset_name)
             if not test:
@@ -195,6 +206,7 @@ def net(
             backbone.name, backbone.seed = backbone_name, backbone_seed
 
             simplenet_inst = simplenet.SimpleNet(device)
+            #simplenet_inst = simplenet_plus.SimpleNet(device)
             simplenet_inst.load(
                 backbone=backbone,
                 layers_to_extract_from=layers_to_extract_from,
@@ -312,7 +324,7 @@ def dataset(
 
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset,
-                batch_size=batch_size,
+                batch_size=1,
                 shuffle=False,
                 num_workers=num_workers,
                 prefetch_factor=2,

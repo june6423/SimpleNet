@@ -249,19 +249,11 @@ class EtriDataset(MVTecDataset):
             image_name = f"{Path(image_path).stem}_p{patch_idx}"
             
         else:
-            # --- TEST: GPU 가속 처리 ---
             classname, anomaly, image_path, mask_path = self.data_to_iterate[idx]
             
             # 1. 이미지 로드 및 ToTensor만 (CPU)
             image_full = PIL.Image.open(image_path).convert("RGB")
             image_tensor = self.transform_img_test(image_full)  # [C, H, W], 0~1
-            
-            # 2. GPU로 전송 (이 부분은 collate_fn에서 처리하거나, 여기서 미리 처리)
-            # NOTE: 여기서 .cuda()를 호출하면 DataLoader의 pin_memory 효과가 사라짐
-            # 대신 반환된 텐서를 나중에 GPU로 전송하고, 그 후 처리하는 것이 좋음
-            
-            # 임시로 여기서는 CPU에서 처리하되, 실제로는 collate_fn에서 GPU 처리 권장
-            # 지금은 일단 CPU 버전으로 반환
             image_tensor_cpu = image_tensor
             
             # 마스크 처리
