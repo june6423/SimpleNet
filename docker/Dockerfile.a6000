@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+
+# This is the linux/amd64 digest behind nvcr.io/nvidia/pytorch:25.01-py3.
+# Pinning the digest prevents a mutable registry tag from silently changing the
+# CUDA/PyTorch base used for a benchmark run.
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:25.01-py3@sha256:0981807f1a51a156563e28b59dc2e7a9b5c1c7d85d1169d4965c5fd91fa38bcb
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libfontconfig1 \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        util-linux \
+        wget \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements-simplenet.txt /tmp/requirements-simplenet.txt
+
+RUN PIP_CONFIG_FILE=/dev/null python -m pip install \
+        --index-url https://pypi.org/simple \
+        --no-cache-dir \
+        --upgrade "pip==25.3" \
+    && PIP_CONFIG_FILE=/dev/null python -m pip install \
+        --index-url https://pypi.org/simple \
+        --no-cache-dir \
+        -r /tmp/requirements-simplenet.txt \
+    && rm /tmp/requirements-simplenet.txt
+
+ENV MPLBACKEND=Agg \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /workspace/SimpleNet
+
+CMD ["/bin/bash"]
