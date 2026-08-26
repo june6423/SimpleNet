@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 import common
 import metrics
 from utils import plot_segmentation_images
-import wandb
+#import wandb
 
 LOGGER = logging.getLogger(__name__)
 
@@ -510,7 +510,7 @@ class SimpleNet(torch.nn.Module):
             else:
                 self.load_state_dict(state_dict, strict=False)
 
-            self.predict(training_data, "train_")
+            #self.predict(training_data, "train_")
             scores, segmentations, features, labels_gt, masks_gt, anomalies_gt = self.predict(test_data)
             auroc, full_pixel_auroc, anomaly_pixel_auroc = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt, anomalies_gt)
             
@@ -563,12 +563,12 @@ class SimpleNet(torch.nn.Module):
                   f"  P-AUROC{round(full_pixel_auroc, 4)}(MAX:{round(best_record[1], 4)}) -----"
                   f"  PRO-AUROC{round(pro, 4)}(MAX:{round(best_record[2], 4)}) -----")
 
-            wandb.log({
-                "meta_epoch"   : i_mepoch,
-                "I-AUROC": auroc,
-                "P-AUROC": full_pixel_auroc,
-                "PRO-AUROC": pro
-            })
+            # wandb.log({
+            #     "meta_epoch"   : i_mepoch,
+            #     "I-AUROC": auroc,
+            #     "P-AUROC": full_pixel_auroc,
+            #     "PRO-AUROC": pro
+            # })
         
         torch.save(state_dict, ckpt_path)
         
@@ -742,7 +742,7 @@ class SimpleNet(torch.nn.Module):
                         "loss_g": loss_g,
                     }
                                      
-                    wandb.log(loss_dict, step=self.logger.g_iter)
+                    #wandb.log(loss_dict, step=self.logger.g_iter)
                 
                 if len(embeddings_list) > 0:
                     self.auto_noise[1] = torch.cat(embeddings_list).std(0).mean(-1)
