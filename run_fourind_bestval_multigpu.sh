@@ -5,11 +5,12 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="${PYTHON_BIN:-python3}"
 data_root="${1:-${FOURIND_DATA_ROOT:-}}"
 results_root="${2:-${script_dir}/results_fourind_bestval}"
-gpu_csv="${3:-0,1}"
+gpu_csv="${3:-0,1,2}"
+split_strategy="${FOURIND_SPLIT_STRATEGY:-chronological}"
 
 if [[ -z "$data_root" ]]; then
     printf 'Usage: %s DATA_ROOT [RESULTS_ROOT] [GPU_CSV]\n' "$0" >&2
-    printf 'Example: %s /datasets/4ind_202608 /results/4ind 0,1\n' "$0" >&2
+    printf 'Example: %s /datasets/4ind_202608 /results/4ind 0,1,2\n' "$0" >&2
     exit 2
 fi
 if [[ ! -d "$data_root" ]]; then
@@ -18,8 +19,8 @@ if [[ ! -d "$data_root" ]]; then
 fi
 
 IFS=',' read -r -a gpus <<<"$gpu_csv"
-if [[ ${#gpus[@]} -lt 1 ]]; then
-    printf 'At least one GPU id is required.\n' >&2
+if [[ ${#gpus[@]} -ne 3 ]]; then
+    printf 'Exactly three GPU ids are required for the 3-GPU x 2-step schedule.\n' >&2
     exit 2
 fi
 for gpu in "${gpus[@]}"; do
@@ -28,10 +29,16 @@ for gpu in "${gpus[@]}"; do
         exit 2
     fi
 done
+if [[ "$split_strategy" != "chronological" \
+    && "$split_strategy" != "date-mixed" ]]; then
+    printf 'Invalid FOURIND_SPLIT_STRATEGY: %s\n' "$split_strategy" >&2
+    exit 2
+fi
 
 mkdir -p "$results_root/logs"
-manifest_path="$results_root/fourind_manifest_seed0.csv"
-manifest_summary="$results_root/fourind_manifest_seed0.summary.json"
+split_tag="${split_strategy//-/_}"
+manifest_path="$results_root/fourind_manifest_${split_tag}_seed0.csv"
+manifest_summary="$results_root/fourind_manifest_${split_tag}_seed0.summary.json"
 
 if [[ ! -f "$manifest_path" ]]; then
     printf 'MANIFEST_START root=%s time=%s\n' \
@@ -42,6 +49,7 @@ if [[ ! -f "$manifest_path" ]]; then
         --summary-path "$manifest_summary" \
         --train-fraction 0.1 \
         --seed 0 \
+        --split-strategy "$split_strategy" \
         >"$results_root/manifest.log" 2>&1; then
         printf 'MANIFEST_FAILED log=%s\n' "$results_root/manifest.log" >&2
         exit 1
@@ -57,13 +65,14 @@ else
     printf 'MANIFEST_REUSE manifest=%s\n' "$manifest_path"
 fi
 
-# Start the two longest high-resolution jobs first.  Workers claim the next
-# item only after their current method/product job has fully finished.
+# Two explicit steps: all three methods for one product run in parallel.
+# Keeping each method on the same GPU across steps makes the schedule easy to
+# audit while preserving every training and evaluation argument below.
 jobs=(
     global_local:KQG27542
-    global_local:KQG27824
     simplenet:KQG27542
     simplenet_plus:KQG27542
+    global_local:KQG27824
     simplenet:KQG27824
     simplenet_plus:KQG27824
 )
@@ -127,57 +136,33 @@ run_job() {
     return 1
 }
 
-queue_index_path="$results_root/.queue_index"
-queue_lock_path="$results_root/.queue.lock"
-printf '0\n' >"$queue_index_path"
-
-claim_job() {
-    local claimed_index
-    exec 9>"$queue_lock_path"
-    flock 9
-    read -r claimed_index <"$queue_index_path"
-    if ((claimed_index >= ${#jobs[@]})); then
-        flock -u 9
-        exec 9>&-
-        return 1
-    fi
-    CLAIMED_JOB="${jobs[$claimed_index]}"
-    printf '%s\n' "$((claimed_index + 1))" >"$queue_index_path"
-    flock -u 9
-    exec 9>&-
-    return 0
-}
-
-worker() {
-    local gpu="$1"
-    local failures=0
-    local job method category
-    while claim_job; do
-        job="$CLAIMED_JOB"
-        method="${job%%:*}"
-        category="${job#*:}"
-        run_job "$gpu" "$method" "$category" || failures=$((failures + 1))
-    done
-    printf 'WORKER_DONE gpu=%s failures=%s time=%s\n' \
-        "$gpu" "$failures" "$(date --iso-8601=seconds)"
-    return "$failures"
-}
-
 printf '%s\n' "$$" >"$results_root/scheduler.pid"
-printf 'SCHEDULER_START pid=%s gpus=%s jobs=%s time=%s\n' \
+printf 'SCHEDULER_START pid=%s gpus=%s jobs=%s steps=2 time=%s\n' \
     "$$" "$gpu_csv" "${#jobs[@]}" "$(date --iso-8601=seconds)"
-
-pids=()
-for index in "${!gpus[@]}"; do
-    worker "${gpus[$index]}" &
-    pids+=("$!")
-done
+printf 'SPLIT_STRATEGY=%s manifest=%s\n' "$split_strategy" "$manifest_path"
 
 worker_failures=0
-for pid in "${pids[@]}"; do
-    status=0
-    wait "$pid" || status=$?
-    worker_failures=$((worker_failures + status))
+for step in 0 1; do
+    printf 'STEP_START step=%s category=%s time=%s\n' \
+        "$((step + 1))" "${jobs[$((step * 3))]#*:}" "$(date --iso-8601=seconds)"
+    pids=()
+    for gpu_index in 0 1 2; do
+        job="${jobs[$((step * 3 + gpu_index))]}"
+        method="${job%%:*}"
+        category="${job#*:}"
+        run_job "${gpus[$gpu_index]}" "$method" "$category" &
+        pids+=("$!")
+    done
+
+    step_failures=0
+    for pid in "${pids[@]}"; do
+        status=0
+        wait "$pid" || status=$?
+        step_failures=$((step_failures + status))
+    done
+    worker_failures=$((worker_failures + step_failures))
+    printf 'STEP_DONE step=%s failures=%s time=%s\n' \
+        "$((step + 1))" "$step_failures" "$(date --iso-8601=seconds)"
 done
 
 merge_status=0

@@ -36,21 +36,40 @@ relative to this root.
 ./run_fourind_bestval_multigpu.sh \
   /server/path/to/4ind_dataset_202608 \
   /server/path/to/results_fourind_bestval \
-  0,1
+  0,1,2
 ```
 
 The dataset root may instead be supplied through `FOURIND_DATA_ROOT`:
 
 ```bash
 FOURIND_DATA_ROOT=/server/path/to/4ind_dataset_202608 \
-  ./run_fourind_bestval_multigpu.sh "" /server/path/to/results 0,1
+  ./run_fourind_bestval_multigpu.sh "" /server/path/to/results 0,1,2
 ```
 
-The two global/local jobs are queued first because their tiled evaluation is
-the longest.  Each GPU claims another independent method/product job when it
-becomes free.  With one GPU, all six jobs run sequentially.  A completed
-`job_result.json` is skipped, while an unfinished job resumes from
-`checkpoint_progress.pth`.
+### Date-mixed re-experiment
+
+Set `FOURIND_SPLIT_STRATEGY=date-mixed` to retain the original per-product
+train/validation/test counts and the exact validation/test count for each
+normal/defect label, while redistributing every split across the available
+capture dates and source blocks.  Model, augmentation, input, training, and
+best-validation settings are unchanged.
+
+```bash
+FOURIND_SPLIT_STRATEGY=date-mixed \
+  ./run_fourind_bestval_multigpu.sh \
+  /workspace/4ind \
+  /workspace/SimpleNet/4ind_result_date_mixed \
+  2,3,4
+```
+
+Use a new results directory.  The launcher records the strategy in
+`fourind_manifest_date_mixed_seed0.summary.json`, including per-split date and
+source-block counts.  The launcher uses two explicit steps: all three methods
+for KQG27542 run together, followed by all three methods for KQG27824.  GPU
+assignments remain fixed by method across both steps.
+
+Exactly three GPU ids are required.  A completed `job_result.json` is skipped,
+while an unfinished job resumes from `checkpoint_progress.pth`.
 
 ## Methods and inputs
 
@@ -68,8 +87,8 @@ selected-checkpoint verification, and final test evaluation on the same GPU.
 
 ```text
 results_root/
-├── fourind_manifest_seed0.csv
-├── fourind_manifest_seed0.summary.json
+├── fourind_manifest_<strategy>_seed0.csv
+├── fourind_manifest_<strategy>_seed0.summary.json
 ├── simplenet/<product>/
 ├── simplenet_plus/<product>/
 ├── global_local/<product>/

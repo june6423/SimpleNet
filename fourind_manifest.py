@@ -15,9 +15,9 @@ import math
 import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, DefaultDict, Dict, Hashable, Iterable, List, Optional, Sequence, Tuple
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -99,6 +99,11 @@ def stable_rank(relative_path: str, seed: int) -> bytes:
     return hashlib.sha256(payload).digest()
 
 
+def derived_seed(seed: int, *parts: str) -> int:
+    payload = "\0".join((str(seed), *parts)).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
 def select_across_time(
     rows: Sequence[Candidate], quota: int, seed: int
 ) -> List[Candidate]:
@@ -144,6 +149,164 @@ def _allocate_stratified_quotas(
     return quotas
 
 
+def _allocate_exact_quotas(
+    group_sizes: Dict[Hashable, int], target: int, ensure_coverage: bool = True
+) -> Dict[Hashable, int]:
+    """Allocate an exact target while retaining every non-empty time stratum."""
+    nonempty = {group: size for group, size in group_sizes.items() if size > 0}
+    total = sum(nonempty.values())
+    if target < 0 or target > total:
+        raise ValueError(f"Cannot allocate target={target} from total={total}.")
+    quotas = {group: 0 for group in nonempty}
+    if target == 0 or not nonempty:
+        return quotas
+
+    if ensure_coverage and target >= len(nonempty):
+        for group in quotas:
+            quotas[group] = 1
+        remaining = target - len(nonempty)
+        capacities = {group: nonempty[group] - 1 for group in nonempty}
+    else:
+        remaining = target
+        capacities = dict(nonempty)
+
+    while remaining > 0:
+        capacity_total = sum(capacities.values())
+        if capacity_total < remaining:
+            raise ValueError(
+                f"Insufficient residual capacity={capacity_total} for {remaining} rows."
+            )
+        raw = {
+            group: capacities[group] * remaining / capacity_total
+            for group in capacities
+        }
+        additions = {
+            group: min(capacities[group], int(math.floor(raw[group])))
+            for group in capacities
+        }
+        assigned = sum(additions.values())
+        for group, addition in additions.items():
+            quotas[group] += addition
+            capacities[group] -= addition
+        remaining -= assigned
+        if remaining == 0:
+            break
+
+        ranked = sorted(
+            (group for group, capacity in capacities.items() if capacity > 0),
+            key=lambda group: (-(raw[group] - math.floor(raw[group])), str(group)),
+        )
+        if not ranked:
+            raise ValueError("No group can accept the remaining quota.")
+        for group in ranked[:remaining]:
+            quotas[group] += 1
+            capacities[group] -= 1
+        remaining -= min(remaining, len(ranked))
+    return quotas
+
+
+def select_stratified_exact(
+    rows: Sequence[Candidate],
+    target: int,
+    seed: int,
+    group_key: Callable[[Candidate], Hashable],
+) -> List[Candidate]:
+    """Select an exact count, spreading samples over date/source strata and time."""
+    groups: DefaultDict[Hashable, List[Candidate]] = defaultdict(list)
+    for row in rows:
+        groups[group_key(row)].append(row)
+    quotas = _allocate_exact_quotas(
+        {group: len(group_rows) for group, group_rows in groups.items()},
+        target,
+        ensure_coverage=True,
+    )
+    selected: List[Candidate] = []
+    for group, group_rows in sorted(groups.items(), key=lambda item: str(item[0])):
+        selected.extend(select_across_time(group_rows, quotas[group], seed))
+    if len(selected) != target:
+        raise AssertionError(f"Selected {len(selected)} rows, expected {target}.")
+    return selected
+
+
+def build_date_mixed_records(
+    candidates: Sequence[Candidate], train_fraction: float, seed: int
+) -> Tuple[List[Candidate], Dict[str, Dict[str, int]]]:
+    """Reassign dates while preserving the chronological protocol's split sizes.
+
+    The reference chronological split determines the train count and the exact
+    validation/test count for every normal/defect label.  Rows are then selected
+    from all dates, stratified by capture date and source block.
+    """
+    records: List[Candidate] = []
+    sampling_summary: Dict[str, Dict[str, int]] = {}
+    by_product: DefaultDict[str, List[Candidate]] = defaultdict(list)
+    for candidate in candidates:
+        by_product[candidate.category].append(candidate)
+
+    for product, product_rows in sorted(by_product.items()):
+        reference_train_pool = [
+            row for row in product_rows if row.split == "train" and row.label == "good"
+        ]
+        train_target = int(math.floor(len(reference_train_pool) * train_fraction))
+        normal_rows = [row for row in product_rows if row.label == "good"]
+        selected_train = select_stratified_exact(
+            normal_rows,
+            train_target,
+            derived_seed(seed, product, "train"),
+            lambda row: (row.capture_date, row.source_block),
+        )
+        selected_train_paths = {row.relative_path for row in selected_train}
+        records.extend(replace(row, split="train") for row in selected_train)
+
+        reference_val = Counter(
+            row.label for row in product_rows if row.split == "val"
+        )
+        reference_test = Counter(
+            row.label for row in product_rows if row.split == "test"
+        )
+        labels = sorted(set(reference_val) | set(reference_test))
+        for label in labels:
+            val_target = int(reference_val[label])
+            test_target = int(reference_test[label])
+            total_target = val_target + test_target
+            label_rows = [
+                row
+                for row in product_rows
+                if row.label == label and row.relative_path not in selected_train_paths
+            ]
+            eval_pool = select_stratified_exact(
+                label_rows,
+                total_target,
+                derived_seed(seed, product, label, "eval-pool"),
+                lambda row: (row.capture_date, row.source_block),
+            )
+            selected_val = select_stratified_exact(
+                eval_pool,
+                val_target,
+                derived_seed(seed, product, label, "val"),
+                lambda row: (row.capture_date, row.source_block),
+            )
+            selected_val_paths = {row.relative_path for row in selected_val}
+            selected_test = [
+                row for row in eval_pool if row.relative_path not in selected_val_paths
+            ]
+            if len(selected_test) != test_target:
+                raise AssertionError(
+                    f"{product}/{label}: selected {len(selected_test)} test rows, "
+                    f"expected {test_target}."
+                )
+            records.extend(replace(row, split="val") for row in selected_val)
+            records.extend(replace(row, split="test") for row in selected_test)
+
+        sampling_summary[product] = {
+            "pool": len(reference_train_pool),
+            "selected": len(selected_train),
+            "source_blocks": len({row.source_block for row in selected_train}),
+            "capture_dates": len({row.capture_date for row in selected_train}),
+        }
+    return records, sampling_summary
+
+
 def select_train_fraction(
     candidates: Iterable[Candidate], fraction: float, seed: int
 ) -> Tuple[List[Candidate], Dict[str, Dict[str, int]]]:
@@ -175,6 +338,7 @@ def select_train_fraction(
 def scan_dataset(
     data_root: Path,
     excluded_blocks: Sequence[str],
+    include_train_period_anomalies: bool = False,
 ) -> Tuple[List[Candidate], Counter, Counter]:
     excluded = set(excluded_blocks)
     candidates: List[Candidate] = []
@@ -223,7 +387,7 @@ def scan_dataset(
             if split is None:
                 skipped["outside_split_dates"] += 1
                 continue
-            if split == "train" and label != "good":
+            if split == "train" and label != "good" and not include_train_period_anomalies:
                 skipped["train_period_anomaly"] += 1
                 continue
 
@@ -259,6 +423,33 @@ def validate_records(
             if "good" not in labels or len(labels) < 2:
                 raise ValueError(
                     f"{product}/{split}: both normal and anomaly images are required."
+                )
+
+
+def validate_date_mixing(
+    records: Sequence[Candidate], candidates: Sequence[Candidate]
+) -> None:
+    """Require each split to cover every available capture date per product."""
+    products = sorted({row.category for row in records})
+    for product in products:
+        product_candidates = [row for row in candidates if row.category == product]
+        expected_dates = {
+            "train": {
+                row.capture_date for row in product_candidates if row.label == "good"
+            },
+            "val": {row.capture_date for row in product_candidates},
+            "test": {row.capture_date for row in product_candidates},
+        }
+        for split in ("train", "val", "test"):
+            actual_dates = {
+                row.capture_date
+                for row in records
+                if row.category == product and row.split == split
+            }
+            if actual_dates != expected_dates[split]:
+                missing = sorted(expected_dates[split] - actual_dates)
+                raise ValueError(
+                    f"{product}/{split}: date-mixed split is missing dates {missing}."
                 )
 
 
@@ -330,6 +521,7 @@ def build_summary(
     train_fraction: float,
     seed: int,
     excluded_blocks: Sequence[str],
+    split_strategy: str,
 ) -> Dict[str, object]:
     counts: DefaultDict[str, Counter] = defaultdict(Counter)
     defect_counts: DefaultDict[str, Counter] = defaultdict(Counter)
@@ -338,12 +530,18 @@ def build_summary(
         counts[row.category][f"{row.split}_{'normal' if row.label == 'good' else 'anomaly'}"] += 1
         if row.label != "good":
             defect_counts[row.category][f"{row.split}:{row.label}"] += 1
+    date_counts: DefaultDict[str, Counter] = defaultdict(Counter)
+    source_block_counts: DefaultDict[str, Counter] = defaultdict(Counter)
+    for row in records:
+        date_counts[row.category][f"{row.split}:{row.capture_date}"] += 1
+        source_block_counts[row.category][f"{row.split}:{row.source_block}"] += 1
     return {
         "data_root_at_generation": str(data_root.resolve()),
         "manifest": str(manifest_path.resolve()),
         "paths_are_relative_to_data_root": True,
         "seed": seed,
         "train_fraction": train_fraction,
+        "split_strategy": split_strategy,
         "excluded_blocks": list(excluded_blocks),
         "scanned": dict(scanned),
         "skipped": dict(sorted(skipped.items())),
@@ -351,6 +549,12 @@ def build_summary(
         "counts": {key: dict(value) for key, value in sorted(counts.items())},
         "defect_counts": {
             key: dict(value) for key, value in sorted(defect_counts.items())
+        },
+        "date_counts": {
+            key: dict(value) for key, value in sorted(date_counts.items())
+        },
+        "source_block_counts": {
+            key: dict(value) for key, value in sorted(source_block_counts.items())
         },
         "manifest_rows": len(records),
         "expected_complete_inventory": {
@@ -362,7 +566,11 @@ def build_summary(
             },
         },
         "selection": (
-            "normal-only train from 2024-12-21..23, deterministic temporal-bin "
+            "date-mixed train/val/test across 2024-12-21..27; exact chronological "
+            "split sizes and per-label val/test counts retained; deterministic "
+            "sampling stratified by capture date and source block"
+            if split_strategy == "date-mixed"
+            else "normal-only train from 2024-12-21..23, deterministic temporal-bin "
             "sampling stratified by source block; full usable val 2024-12-24..25; "
             "full usable test 2024-12-26..27"
         ),
@@ -384,6 +592,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--summary-path")
     parser.add_argument("--train-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--split-strategy",
+        choices=("chronological", "date-mixed"),
+        default="chronological",
+        help="Chronological reference split or date/source/label-stratified mixed split.",
+    )
     parser.add_argument(
         "--exclude-block",
         action="append",
@@ -409,15 +623,26 @@ def main() -> None:
     if not 0.0 < args.train_fraction <= 1.0:
         raise ValueError("--train-fraction must be in (0, 1].")
 
-    candidates, scanned, skipped = scan_dataset(data_root, args.exclude_block)
-    train_candidates = [row for row in candidates if row.split == "train"]
-    selected_train, sampling = select_train_fraction(
-        train_candidates, args.train_fraction, args.seed
+    candidates, scanned, skipped = scan_dataset(
+        data_root,
+        args.exclude_block,
+        include_train_period_anomalies=args.split_strategy == "date-mixed",
     )
-    records = selected_train + [row for row in candidates if row.split != "train"]
+    if args.split_strategy == "date-mixed":
+        records, sampling = build_date_mixed_records(
+            candidates, args.train_fraction, args.seed
+        )
+    else:
+        train_candidates = [row for row in candidates if row.split == "train"]
+        selected_train, sampling = select_train_fraction(
+            train_candidates, args.train_fraction, args.seed
+        )
+        records = selected_train + [row for row in candidates if row.split != "train"]
     if not args.allow_incomplete:
         validate_records(records, args.expected_products)
         validate_known_inventory(records, scanned, args.train_fraction)
+        if args.split_strategy == "date-mixed":
+            validate_date_mixing(records, candidates)
 
     output_path = Path(args.output).expanduser().resolve()
     summary_path = (
@@ -436,6 +661,7 @@ def main() -> None:
         train_fraction=args.train_fraction,
         seed=args.seed,
         excluded_blocks=args.exclude_block,
+        split_strategy=args.split_strategy,
     )
     atomic_json_dump(summary, summary_path)
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
