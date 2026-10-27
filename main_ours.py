@@ -27,6 +27,7 @@ _DATASETS = {
     "mvtec": ["datasets.mvtec", "MVTecDataset"],
     "etri": ["datasets.etri", "EtriDataset"],
     "etri_printing": ["datasets.etri_printing", "EtriPrintingDataset"],
+    "visa": ["datasets.visa_mvtecstyle", "VisAMVTecStyleDataset"],
 }
 
 
