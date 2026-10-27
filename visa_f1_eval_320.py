@@ -19,14 +19,19 @@ as ``mvtec_f1_eval.py`` does at 224.
 The script loads the selected checkpoint of each job and does not train.
 Image level: AUROC and F1-max (``f1_max`` of ``mvtec_f1_eval.py``).
 
-``--config deglad-s`` (global_local only) first times one model pass over the
-test split with the standard path, then sets ``fast_feature_interpolation`` on
+``--config deglad-s`` (global_local only) first runs and times one model pass
+over the test split with the standard path and keeps its image scores, then
+sets ``feature_interpolation_mode = "channels_last"`` (fp32 interpolation) on
 the model instance and runs the backbone and the heads under fp16 autocast
 with channels_last (score grids cast to float32 before normalization) for the
 evaluation.  It writes ``<dataset>/deglad_s/<category>/f1_eval.json`` and
-compares with the global_local row of ``--reference-summary``.  ``merge
---config deglad-s`` writes ``deglad_s_f1_summary.csv`` and
-``deglad_s_timing.csv`` over both datasets.
+compares with the global_local row of ``--reference-summary``.
+
+``timing`` times the standard path and DeGLAD-S over the first
+``--image-count`` test images of one global_local category, one pass each,
+and writes ``timing_gpu7/<dataset>_<category>.json``.  ``merge --config
+deglad-s`` writes ``deglad_s_f1_summary.csv``, ``deglad_s_timing.csv``, and
+``deglad_s_timing_gpu7.csv``.
 
 Usage (inside the docker image, cwd = repository root):
 
@@ -41,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import math
 import sys
@@ -137,14 +143,15 @@ def timed_iter_predictions(model, loader, times=None):
 def use_deglad_s(model):
     """Switch a global_local model to DeGLAD-S on this instance only.
 
-    ``fast_feature_interpolation`` is True, and the backbone and the heads run
-    under fp16 autocast with channels_last inputs and weights, as V1 of
-    ``profile_gl_inference.py``.  The score grids become float32 before the
-    upsample and the normalization.  High-resolution path: ``_score_maps``
-    calls the two wrapped methods below.  Legacy path (MVTec):
-    ``_predict_legacy_batch`` runs under autocast.
+    ``feature_interpolation_mode`` is "channels_last" with the interpolation in
+    fp32, and the backbone and the heads run under fp16 autocast with
+    channels_last inputs and weights (SIMPLENET-SPEED-001 R7 C2).  The score
+    grids become float32 before the upsample and the normalization.
+    High-resolution path: ``_score_maps`` calls the two wrapped methods below.
+    Legacy path (MVTec): ``_predict_legacy_batch`` runs under autocast.
     """
-    model.fast_feature_interpolation = True
+    model.feature_interpolation_mode = "channels_last"
+    model.feature_interpolation_fp16 = False
     model.backbone.to(memory_format=torch.channels_last)
     raw_score_grid = model._raw_score_grid
     score_maps_from_grid = model._score_maps_from_grid
@@ -169,30 +176,47 @@ def use_deglad_s(model):
     model._predict_legacy_batch = fast_predict_legacy_batch
 
 
-def prepare_config(args, model, loader):
-    """For deglad-s: time one standard model pass over ``loader``, then switch the model.
+def standard_pass(model, loader):
+    """One standard model pass: per-image model seconds, image scores, and labels."""
+    standard = {"times": [], "scores": [], "labels": []}
+    for prediction in timed_iter_predictions(model, loader, standard["times"]):
+        standard["scores"].append(float(prediction["score"]))
+        standard["labels"].append(int(prediction["label"]))
+    return standard
 
-    Returns the per-image model seconds of the standard pass, or None.
+
+def prepare_config(args, model, loader):
+    """For deglad-s: run one standard model pass over ``loader``, then switch the model.
+
+    Returns the result of ``standard_pass``, or None.
     """
     if args.config != "deglad-s":
         return None
-    standard_times = []
-    for _prediction in timed_iter_predictions(model, loader, standard_times):
-        pass
+    standard = standard_pass(model, loader)
     use_deglad_s(model)
-    return standard_times
+    return standard
 
 
-def timing_fields(model, standard_times, deglad_s_times):
-    standard = 1000.0 * float(np.mean(standard_times[TIMING_WARMUP_IMAGES:]))
-    deglad_s = 1000.0 * float(np.mean(deglad_s_times[TIMING_WARMUP_IMAGES:]))
+def mean_ms(times):
+    return 1000.0 * float(np.mean(times[TIMING_WARMUP_IMAGES:]))
+
+
+def timing_fields(model, standard, deglad_s_times):
+    """The DeGLAD-S configuration, the standard-pass image metrics, and the timing."""
+    standard_ms = mean_ms(standard["times"])
+    deglad_s_ms = mean_ms(deglad_s_times)
     return {
-        "fast_feature_interpolation": bool(model.fast_feature_interpolation),
+        "feature_interpolation_mode": model.feature_interpolation_mode,
+        "feature_interpolation_fp16": bool(model.feature_interpolation_fp16),
+        "standard_image_auroc": float(skm.roc_auc_score(standard["labels"], standard["scores"])),
+        "standard_image_f1_max": f1_max(
+            np.asarray(standard["labels"]), np.asarray(standard["scores"])
+        )["f1_max"],
         "timing_images": len(deglad_s_times),
         "timing_warmup_images": TIMING_WARMUP_IMAGES,
-        "standard_model_ms_per_image": standard,
-        "deglad_s_model_ms_per_image": deglad_s,
-        "speedup": standard / deglad_s,
+        "standard_model_ms_per_image": standard_ms,
+        "deglad_s_model_ms_per_image": deglad_s_ms,
+        "speedup": standard_ms / deglad_s_ms,
     }
 
 
@@ -287,7 +311,7 @@ def evaluate_visa(args, checkpoint, device):
     if args.method == "global_local":
         model = fixed_runner.build_global_local_model(runner_args, train_dataset.imagesize, device)
         load_global_local_checkpoint(model, checkpoint, load_optimizer=False)
-        standard_times = prepare_config(args, model, loader)
+        standard = prepare_config(args, model, loader)
         loader = TileCounter(loader)
     else:
         model = fixed_runner.build_baseline_model(runner_args, train_dataset.imagesize, device)
@@ -347,8 +371,8 @@ def evaluate_visa(args, checkpoint, device):
                 "tiles_per_image": {"min": min(tile_counts), "max": max(tile_counts)},
             }
         )
-        if standard_times is not None:
-            fields.update(timing_fields(model, standard_times, deglad_s_times))
+        if standard is not None:
+            fields.update(timing_fields(model, standard, deglad_s_times))
     return scores, labels, fields
 
 
@@ -375,12 +399,12 @@ def evaluate_mvtec(args, checkpoint, device):
         loader = mvtec_gl_runner.build_loader(test_dataset, 1, args.num_workers, shuffle=False)
         model = mvtec_gl_runner.build_model(runner_args, device)
         load_global_local_checkpoint(model, checkpoint, load_optimizer=False)
-        standard_times = prepare_config(args, model, loader)
+        standard = prepare_config(args, model, loader)
     else:
         _train_loader, loader = mvtec_baseline_runner.build_dataloaders(runner_args, 0.0)
         model = mvtec_baseline_runner.build_model(runner_args, device)
         mvtec_baseline_runner.load_selected_checkpoint(model, checkpoint)
-        standard_times = None
+        standard = None
 
     scores, labels, seg_maps, gt_masks = [], [], [], []
     deglad_s_times = []
@@ -410,9 +434,94 @@ def evaluate_mvtec(args, checkpoint, device):
         "pixel_positive_count": int(flat_gt.sum()),
         "pixel_negative_count": int(flat_gt.size - flat_gt.sum()),
     }
-    if standard_times is not None:
-        fields.update(timing_fields(model, standard_times, deglad_s_times))
+    if standard is not None:
+        fields.update(timing_fields(model, standard, deglad_s_times))
     return scores, labels, fields
+
+
+def build_global_local(args, checkpoint, device):
+    """The global_local model and test loader that evaluate_visa or evaluate_mvtec builds."""
+    if args.dataset == "visa":
+        runner_args = argparse.Namespace(
+            method="global_local",
+            category=args.category,
+            data_path=args.data_root,
+            seed=args.seed,
+            imagesize=args.imagesize,
+            meta_epochs=args.meta_epochs,
+            gan_epochs=args.gan_epochs,
+            smoke=False,
+        )
+        train_dataset, test_dataset, _augmentation = fixed_runner.build_datasets(runner_args)
+        loader = fixed_runner.build_loader(test_dataset, 1, args.num_workers, shuffle=False)
+        model = fixed_runner.build_global_local_model(runner_args, train_dataset.imagesize, device)
+    else:
+        runner_args = argparse.Namespace(
+            method="global_local",
+            category=args.category,
+            data_path=args.data_root,
+            seed=args.seed,
+            resize=args.resize,
+            imagesize=args.imagesize,
+            meta_epochs=args.meta_epochs,
+            gan_epochs=args.gan_epochs,
+            batch_size=8,
+            num_workers=args.num_workers,
+            augmentation=0.0,
+            smoke=False,
+        )
+        _train_dataset, test_dataset = mvtec_gl_runner.build_datasets(runner_args)
+        loader = mvtec_gl_runner.build_loader(test_dataset, 1, args.num_workers, shuffle=False)
+        model = mvtec_gl_runner.build_model(runner_args, device)
+    load_global_local_checkpoint(model, checkpoint, load_optimizer=False)
+    return model, loader
+
+
+def time_category(args: argparse.Namespace) -> None:
+    """Time the standard path and DeGLAD-S over the first test images of one category."""
+    args.method = "global_local"
+    checkpoint, _reference_csv = checkpoint_paths(args)
+    if not checkpoint.is_file():
+        sys.exit(f"Checkpoint not found: {checkpoint}")
+    device = torch.device(f"cuda:{args.gpu}")
+    utils.fix_seeds(args.seed, with_torch=True, with_cuda=True)
+    model, loader = build_global_local(args, checkpoint, device)
+    standard = standard_pass(model, itertools.islice(loader, args.image_count))
+    use_deglad_s(model)
+    deglad_s_times = []
+    for _prediction in timed_iter_predictions(
+        model, itertools.islice(loader, args.image_count), deglad_s_times
+    ):
+        pass
+    standard_ms = mean_ms(standard["times"])
+    deglad_s_ms = mean_ms(deglad_s_times)
+    result = {
+        "dataset": args.dataset,
+        "category": args.category,
+        "checkpoint": str(checkpoint),
+        "gpu_name": torch.cuda.get_device_name(device),
+        "torch_version": torch.__version__,
+        "image_count": len(deglad_s_times),
+        "standard_image_count": len(standard["times"]),
+        "warmup_images": TIMING_WARMUP_IMAGES,
+        "standard_ms_per_image": standard_ms,
+        "deglad_s_ms_per_image": deglad_s_ms,
+        "ratio": standard_ms / deglad_s_ms,
+        "feature_interpolation_mode": model.feature_interpolation_mode,
+        "feature_interpolation_fp16": bool(model.feature_interpolation_fp16),
+        "autocast_fp16": True,
+        "channels_last": True,
+        "standard_times_s": standard["times"],
+        "deglad_s_times_s": deglad_s_times,
+    }
+    out_dir = Path(args.results_root) / "timing_gpu7"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with (out_dir / f"{args.dataset}_{args.category}.json").open("w") as stream:
+        json.dump(result, stream, indent=2)
+    print(
+        f"{args.dataset:<6}{args.category:<12}images={len(deglad_s_times)} "
+        f"standard={standard_ms:.2f}ms deglad_s={deglad_s_ms:.2f}ms ratio={standard_ms / deglad_s_ms:.3f}"
+    )
 
 
 def reference_summary_row(path: Path, category: str):
@@ -555,6 +664,7 @@ def merge_deglad_s(args: argparse.Namespace) -> None:
         ["dataset", "category", "n_test", *METRICS]
         + [f"reference_{metric}" for metric in METRICS]
         + [f"{metric}_diff" for metric in METRICS]
+        + ["standard_image_auroc", "standard_image_f1_max"]
     )
     timing_columns = [
         "dataset", "category", "timing_images", "standard_model_ms_per_image",
@@ -573,6 +683,26 @@ def merge_deglad_s(args: argparse.Namespace) -> None:
                     writer.writerow([dataset, f"MEAN({len(sub)})", sum(r[cols[2]] for r in sub)]
                                     + [np.mean([r[c] for r in sub]) for c in cols[3:]])
         print(f"Wrote {root / name}")
+
+    gpu7_rows = []
+    for path in sorted((root / "timing_gpu7").glob("*.json")):
+        with path.open() as stream:
+            gpu7_rows.append(json.load(stream))
+    if not gpu7_rows:
+        sys.exit("No timing_gpu7 file found.")
+    gpu7_columns = ["dataset", "category", "image_count", "standard_ms_per_image",
+                    "deglad_s_ms_per_image", "ratio"]
+    with (root / "deglad_s_timing_gpu7.csv").open("w", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(gpu7_columns)
+        for row in gpu7_rows:
+            writer.writerow([row[c] for c in gpu7_columns])
+        for dataset in DATASETS:
+            sub = [r for r in gpu7_rows if r["dataset"] == dataset]
+            if sub:
+                writer.writerow([dataset, f"MEAN({len(sub)})", sum(r["image_count"] for r in sub)]
+                                + [np.mean([r[c] for r in sub]) for c in gpu7_columns[3:]])
+    print(f"Wrote {root / 'deglad_s_timing_gpu7.csv'}")
 
 
 def main() -> None:
@@ -596,6 +726,21 @@ def main() -> None:
     ev.add_argument("--num-workers", type=int, default=4)
     ev.add_argument("--config", choices=("standard", "deglad-s"), default="standard")
     ev.add_argument("--reference-summary", help="deglad-s: the earlier F1 summary CSV.")
+    tm = sub.add_parser("timing")
+    tm.add_argument("--dataset", choices=DATASETS, required=True)
+    tm.add_argument("--category", required=True)
+    tm.add_argument("--checkpoint-root", required=True)
+    tm.add_argument("--data-root", required=True)
+    tm.add_argument("--results-root", required=True)
+    tm.add_argument("--image-count", type=int, default=100)
+    tm.add_argument("--gpu", type=int, default=0)
+    tm.add_argument("--seed", type=int, default=0)
+    tm.add_argument("--resize", type=int, default=329, help="MVTec only.")
+    tm.add_argument("--imagesize", type=int, default=320)
+    tm.add_argument("--meta-epochs", type=int, default=40)
+    tm.add_argument("--gan-epochs", type=int, default=4)
+    tm.add_argument("--num-workers", type=int, default=4)
+    tm.set_defaults(reference_csv=None)
     mg = sub.add_parser("merge")
     mg.add_argument("--dataset", choices=DATASETS, default="visa")
     mg.add_argument("--results-root", required=True)
@@ -603,6 +748,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "eval":
         evaluate(args)
+    elif args.command == "timing":
+        time_category(args)
     elif args.config == "deglad-s":
         merge_deglad_s(args)
     else:

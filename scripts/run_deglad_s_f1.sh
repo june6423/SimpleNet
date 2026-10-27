@@ -3,9 +3,14 @@
 # checkpoints (15 MVTec, 12 ViSA) inside the persistent container, with the
 # standard-path timing per category.  Evaluation only, no training, no docker
 # run.
+# Phase 1: the 27 evaluations on the GPUs of DEGLAD_S_GPUS.  Phase 2, at the
+# same time: the standard and DeGLAD-S timing of six categories, one after the
+# other, alone on DEGLAD_S_TIMING_GPU.
 # Usage: scripts/run_deglad_s_f1.sh OUTPUT_ROOT
 # Results go to OUTPUT_ROOT/<dataset>/deglad_s/<category>/f1_eval.json,
-# OUTPUT_ROOT/deglad_s_f1_summary.csv, and OUTPUT_ROOT/deglad_s_timing.csv.
+# OUTPUT_ROOT/timing_gpu7/<dataset>_<category>.json,
+# OUTPUT_ROOT/deglad_s_f1_summary.csv, OUTPUT_ROOT/deglad_s_timing.csv, and
+# OUTPUT_ROOT/deglad_s_timing_gpu7.csv.
 # /proc/loadavg and nvidia-smi go to OUTPUT_ROOT/logs/monitor.log at the start,
 # every 30 minutes, and at the end.
 set -euo pipefail
@@ -22,6 +27,8 @@ reference_dir="references/deglad_s_f1_001"
 IFS=',' read -r -a gpus <<< "${DEGLAD_S_GPUS:-0,1,2,3,4,5,6}"
 jobs_per_gpu="${DEGLAD_S_JOBS_PER_GPU:-2}"
 threads="${DEGLAD_S_THREADS_PER_JOB:-4}"
+timing_gpu="${DEGLAD_S_TIMING_GPU:-7}"
+timing_jobs=(mvtec:bottle mvtec:carpet mvtec:screw visa:candle visa:pcb4 visa:macaroni1)
 mvtec_categories=(hazelnut screw carpet pill grid leather wood zipper tile cable metal_nut capsule transistor bottle toothbrush)
 visa_categories=(pcb1 pcb2 pcb3 pcb4 macaroni1 macaroni2 candle capsules chewinggum cashew fryum pipe_fryum)
 
@@ -94,7 +101,35 @@ worker() {
     return "$failures"
 }
 
+timing_worker() {
+    local failures=0 job dataset category checkpoint_root data_root
+    local log="$output_root/logs/timing_gpu${timing_gpu}.log"
+    for job in "${timing_jobs[@]}"; do
+        dataset="${job%%:*}"
+        category="${job#*:}"
+        if [[ "$dataset" == mvtec ]]; then
+            checkpoint_root="$mvtec_checkpoint_root" data_root="$mvtec_data_root"
+        else
+            checkpoint_root="$visa_checkpoint_root" data_root="$visa_data_root"
+        fi
+        printf 'TIMING_START gpu=%s %s/%s %s\n' "$timing_gpu" "$dataset" "$category" "$(date --iso-8601=seconds)"
+        if ! python3 visa_f1_eval_320.py timing --dataset "$dataset" --category "$category" \
+            --checkpoint-root "$checkpoint_root" --data-root "$data_root" \
+            --results-root "$output_root" --image-count 100 --gpu "$timing_gpu" \
+            --num-workers 4 >> "$log" 2>&1; then
+            printf 'TIMING_FAILED gpu=%s %s/%s log=%s\n' "$timing_gpu" "$dataset" "$category" "$log"
+            failures=$((failures + 1))
+            continue
+        fi
+        printf 'TIMING_DONE gpu=%s %s/%s %s\n' "$timing_gpu" "$dataset" "$category" "$(date --iso-8601=seconds)"
+        tail -1 "$log"
+    done
+    return "$failures"
+}
+
 pids=()
+timing_worker &
+pids+=($!)
 for (( s = 0; s < slots; s++ )); do
     worker "$s" "${gpus[$(( s % ${#gpus[@]} ))]}" &
     pids+=($!)
