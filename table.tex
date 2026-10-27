@@ -1,0 +1,54 @@
+%\onecolumn
+\begin{table*}[t]
+\centering
+\caption{
+    Full MVTec AD results for Image-level (I-AUROC) and Pixel-level (P-AUROC) performance.
+    All models are (re-)evaluated under our unified protocol (320x320 resolution, BS=8).
+    SimpleNet Baseline uses our photometric augmentation.
+    Ours reports best-test results selected by I-AUROC, with P-AUROC used as the tie-breaker.
+}
+\label{tab:main_results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}l|ccc|ccc|ccc@{}}
+\toprule
+\hline
+ & \multicolumn{3}{c|}{SimpleNet} & \multicolumn{3}{c|}{SimpleNet++} & \multicolumn{3}{c}{Ours} \\
+\hline
+Category & I-AUROC & P-AUROC & PRO-AUROC & I-AUROC & P-AUROC & PRO-AUROC & I-AUROC & P-AUROC & PRO-AUROC \\
+\hline
+\midrule
+\multicolumn{10}{l}{\textit{Text}} \\
+\hline
+Carpet & 99.48 & 98.02 & 88.56 & \textbf{99.80} & 98.00 & 86.60 & 99.64 & \textbf{98.21} & \textbf{93.84} \\
+Grid & \textbf{100.0} & \textbf{99.03} & 96.77 & \textbf{100.0} & 98.95 & 96.84 & \textbf{100.0} & 99.01 & \textbf{96.86} \\
+Leather & \textbf{100.0} & \textbf{99.29} & 97.31 & \textbf{100.0} & 99.16 & 96.69 & \textbf{100.0} & \textbf{99.29} & \textbf{97.86} \\
+Tile & \textbf{100.0} & \textbf{96.99} & \textbf{93.03} & \textbf{100.0} & 94.90 & 91.45 & \textbf{100.0} & 96.71 & 89.20 \\
+Wood & 99.47 & 93.69 & 84.18 & \textbf{99.65} & \textbf{94.22} & \textbf{85.18} & 99.30 & 91.77 & 84.56 \\
+\hline
+\midrule
+Avg.Text & 99.79 & \textbf{97.40} & 91.97 & \textbf{99.89} & 97.05 & 91.35 & 99.79 & 97.00 & \textbf{92.46} \\
+\hline
+\midrule
+\multicolumn{10}{l}{\textit{Objects}} \\
+\hline
+Bottle & \textbf{100.0} & 98.31 & 92.75 & \textbf{100.0} & 98.27 & 92.80 & \textbf{100.0} & \textbf{98.51} & \textbf{93.79} \\
+Cable & 99.70 & \textbf{97.76} & 91.91 & 99.57 & 95.62 & 89.46 & \textbf{99.81} & 97.49 & \textbf{92.18} \\
+Capsule & \textbf{99.96} & \textbf{99.12} & 94.04 & \textbf{99.96} & 99.02 & 94.38 & 99.92 & 99.03 & \textbf{95.95} \\
+Hazelnut & \textbf{100.0} & 98.31 & 85.67 & \textbf{100.0} & 98.11 & 85.41 & \textbf{100.0} & \textbf{98.42} & \textbf{95.77} \\
+Metal Nut & \textbf{100.0} & 98.85 & 86.88 & \textbf{100.0} & 98.93 & 88.75 & \textbf{100.0} & \textbf{99.07} & \textbf{94.53} \\
+Pill & 98.17 & \textbf{98.72} & \textbf{95.14} & 98.24 & 97.83 & 92.69 & \textbf{98.53} & 98.63 & 94.78 \\
+Screw & 98.79 & 99.33 & 97.03 & \textbf{98.92} & \textbf{99.85} & \textbf{99.45} & 98.34 & 99.25 & 96.88 \\
+Toothbrush & 97.78 & 97.06 & 87.89 & \textbf{99.50} & \textbf{98.07} & \textbf{90.58} & 96.11 & 97.22 & 81.63 \\
+Transistor & \textbf{100.0} & 85.53 & 92.72 & 99.92 & 83.49 & 89.46 & 99.96 & \textbf{95.91} & \textbf{93.15} \\
+Zipper & \textbf{99.97} & \textbf{98.97} & \textbf{98.97} & 99.95 & 98.91 & 96.03 & \textbf{99.97} & 98.40 & 95.31 \\
+\hline
+\midrule
+Avg.Obj. & 99.44 & 97.19 & 92.30 & \textbf{99.61} & 97.67 & 91.41 & 99.26 & \textbf{98.19} & \textbf{93.40} \\
+\hline
+\midrule
+Avg & 99.56 & \textbf{97.93} & 92.19 & \textbf{99.70} & 97.46 & 91.39 & 99.44 & 97.79 & \textbf{93.09} \\
+\bottomrule
+\hline
+\end{tabular}
+}
+\end{table*}

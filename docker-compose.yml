@@ -1,0 +1,25 @@
+services:
+  simplenet:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.a6000
+    image: simplenet-a6000:rebuild
+    container_name: SimpleNet-A6000
+    working_dir: /workspace/SimpleNet
+    volumes:
+      - /home/vision/dongjun:/workspace
+    shm_size: "${SIMPLENET_SHM_SIZE:-64g}"
+    environment:
+      MPLBACKEND: Agg
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+    stdin_open: true
+    tty: true
+    command: bash
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

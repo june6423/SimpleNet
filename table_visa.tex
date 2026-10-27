@@ -1,0 +1,39 @@
+%\onecolumn
+\begin{table*}[t]
+\centering
+\caption{
+    Full ViSA results for Image-level (I-AUROC) and Pixel-level (P-AUROC) performance.
+    All models are (re-)evaluated under our unified best-test protocol (320x320 resolution, BS=8).
+    SimpleNet uses no photometric augmentation, while SimpleNet++ and Ours use photometric augmentation with a factor of 0.1.
+    Best-test checkpoints are selected by I-AUROC, with P-AUROC used as the tie-breaker.
+}
+\label{tab:visa_main_results}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{@{}l|cc|cc|cc@{}}
+\toprule
+\hline
+ & \multicolumn{2}{c|}{SimpleNet} & \multicolumn{2}{c|}{SimpleNet++} & \multicolumn{2}{c}{Ours} \\
+\hline
+Category & I-AUROC & P-AUROC & I-AUROC & P-AUROC & I-AUROC & P-AUROC \\
+\hline
+\midrule
+Candle & 98.07 & \textbf{98.73} & \textbf{99.15} & 97.62 & 97.84 & 94.66 \\
+Capsules & 87.42 & 99.39 & 85.58 & 99.20 & \textbf{97.62} & \textbf{99.41} \\
+Cashew & 96.46 & \textbf{99.13} & 94.18 & 97.77 & \textbf{96.62} & 95.21 \\
+Chewing gum & 99.76 & 98.50 & 99.58 & 98.32 & \textbf{99.98} & \textbf{98.79} \\
+Fryum & 98.20 & \textbf{94.87} & 97.02 & 87.69 & \textbf{99.76} & 90.60 \\
+Macaroni 1 & 98.46 & 99.51 & 98.08 & 99.29 & \textbf{99.64} & \textbf{99.83} \\
+Macaroni 2 & 85.56 & 98.09 & 82.92 & 92.30 & \textbf{94.06} & \textbf{99.55} \\
+PCB 1 & \textbf{99.08} & \textbf{99.73} & 98.35 & 99.65 & 98.87 & 99.27 \\
+PCB 2 & \textbf{99.65} & \textbf{98.43} & 98.27 & 97.64 & 99.50 & 97.70 \\
+PCB 3 & 96.97 & 98.69 & 95.71 & 98.38 & \textbf{99.81} & \textbf{98.89} \\
+PCB 4 & 99.42 & \textbf{98.25} & 98.95 & 95.22 & \textbf{99.81} & 93.30 \\
+Pipe fryum & 99.68 & \textbf{99.22} & 99.52 & 99.17 & \textbf{99.92} & 98.32 \\
+\hline
+\midrule
+Avg & 96.56 & \textbf{98.55} & 95.61 & 96.85 & \textbf{98.62} & 97.13 \\
+\bottomrule
+\hline
+\end{tabular}
+}
+\end{table*}
