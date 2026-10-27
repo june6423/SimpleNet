@@ -19,7 +19,7 @@ import common
 import metrics
 import simplenet_plus
 import utils
-import wandb
+#import wandb
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,12 +96,12 @@ def run(
             )
             # torch.cuda.empty_cache()
             
-            wandb.init(
-                project=log_project,
-                group=log_group,
-                name=dataset_name+"_directKD",
-                reinit=True
-            )
+            # wandb.init(
+            #     project=log_project,
+            #     group=log_group,
+            #     name=dataset_name+"_directKD",
+            #     reinit=True
+            # )
 
             SimpleNet.set_model_dir(os.path.join(models_dir, f"{i}"), dataset_name)
             if not test:

@@ -10,7 +10,8 @@ import random
 from .mvtec import MVTecDataset, DatasetSplit, IMAGENET_MEAN, IMAGENET_STD
 
 # 모든 폴더 번호 (10~20)
-_FOLDER_NUMBERS = list(range(10, 21))  # [10, 11, 12, ..., 20]
+_FOLDER_NUMBERS = list(range(10, 23))  # [10, 11, 12, ..., 20]
+_FOLDER_NUMBERS2 = list(range(8,18))
 
 
 class EtriPrintingDataset(MVTecDataset):
@@ -123,7 +124,7 @@ class EtriPrintingDataset(MVTecDataset):
 
         if self.split == DatasetSplit.TRAIN:
             # Train: 11/normal 폴더만 사용
-            train_path = os.path.join(self.source, "11", "normal")
+            train_path = os.path.join(self.source, "data1","11", "normal")
             if not os.path.exists(train_path):
                 raise FileNotFoundError(f"Train path not found: {train_path}")
             
@@ -155,12 +156,76 @@ class EtriPrintingDataset(MVTecDataset):
                 print(f"Loaded {len(sampled_files)} normal test images from 10/normal ({self.test_normal_ratio*100:.0f}%)")
             else:
                 print(f"Warning: 10/normal path not found: {test_normal_path}")
+
+            
+            for folder_num in _FOLDER_NUMBERS:
+                test_normal_path = os.path.join(self.source, "data1",str(folder_num), "normal")
+                
+                if os.path.exists(test_normal_path):
+                    normal_files = sorted([
+                        f for f in os.listdir(test_normal_path) 
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                    ])
+                    
+                    random.seed(42)
+                    num_samples = max(1, int(len(normal_files) * self.test_normal_ratio))
+                    sampled_files = random.sample(normal_files, num_samples)
+                    
+                    for file_name in sampled_files:
+                        image_path = os.path.join(test_normal_path, file_name)
+                        data_to_iterate.append((classname, "good", image_path, None))
+                    
+                    print(f"Loaded {len(sampled_files)} normal test images from data1/{str(folder_num)}/normal ({self.test_normal_ratio*100:.0f}%)")
+                else:
+                    print(f"Warning: data1/{str(folder_num)}/normal path not found: {test_normal_path}")
+
+            for folder_num in _FOLDER_NUMBERS2:
+                test_normal_path = os.path.join(self.source, "data2",str(folder_num), "normal")
+                
+                if os.path.exists(test_normal_path):
+                    normal_files = sorted([
+                        f for f in os.listdir(test_normal_path) 
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp'))
+                    ])
+                    
+                    random.seed(42)
+                    num_samples = max(1, int(len(normal_files) * self.test_normal_ratio))
+                    sampled_files = random.sample(normal_files, num_samples)
+                    
+                    for file_name in sampled_files:
+                        image_path = os.path.join(test_normal_path, file_name)
+                        data_to_iterate.append((classname, "good", image_path, None))
+                    
+                    print(f"Loaded {len(sampled_files)} normal test images from data2/{str(folder_num)}/normal ({self.test_normal_ratio*100:.0f}%)")
+                else:
+                    print(f"Warning: data2/{str(folder_num)}/normal path not found: {test_normal_path}")
             
             # 모든 폴더의 flaw 데이터 로드 (단일 클래스로 처리)
             total_flaw_count = 0
             
             for folder_num in _FOLDER_NUMBERS:
-                flaw_path = os.path.join(self.source, str(folder_num), "flaw")
+                flaw_path = os.path.join(self.source, "data1",str(folder_num), "flaw")
+                
+                if not os.path.exists(flaw_path):
+                    continue
+                
+                folder_flaw_count = 0
+                
+                # flaw 폴더 내부의 모든 이미지를 재귀적으로 로드
+                for root, dirs, files in os.walk(flaw_path):
+                    for file_name in files:
+                        if file_name.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
+                            image_path = os.path.join(root, file_name)
+                            # 모든 flaw를 "flaw"로 통일
+                            data_to_iterate.append((classname, "flaw", image_path, None))
+                            folder_flaw_count += 1
+                            total_flaw_count += 1
+                
+                if folder_flaw_count > 0:
+                    print(f"  - Folder {folder_num}/flaw: {folder_flaw_count} images")
+            
+            for folder_num in _FOLDER_NUMBERS2:
+                flaw_path = os.path.join(self.source, "data2",str(folder_num), "flaw")
                 
                 if not os.path.exists(flaw_path):
                     continue

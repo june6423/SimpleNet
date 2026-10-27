@@ -77,6 +77,8 @@ versions observed in the working container. Use the small `docker` directory
 as the build context so result folders and datasets are not sent to Docker:
 
 ```bash
+cd /home/vision/dongjun/SimpleNet
+
 docker build \
   --file docker/Dockerfile.a6000 \
   --tag simplenet-a6000:rebuild \
@@ -97,6 +99,8 @@ the result directory remains on the host.
 Open a shell using the exact image:
 
 ```bash
+cd /home/vision/dongjun/SimpleNet
+
 ./docker/run_a6000_rootless.sh \
   /server/path/to/4ind_dataset_202608 \
   /server/path/to/results_fourind_bestval
@@ -105,10 +109,12 @@ Open a shell using the exact image:
 Run all six method/product jobs directly:
 
 ```bash
+cd /home/vision/dongjun/SimpleNet
+
 ./docker/run_a6000_rootless.sh \
   /server/path/to/4ind_dataset_202608 \
   /server/path/to/results_fourind_bestval \
-  ./run_fourind_bestval_multigpu.sh /data/4ind /results 0,1
+  ./run_fourind_bestval_multigpu.sh /data/4ind /results 0,1,2
 ```
 
 Use the rebuilt image instead:
@@ -125,3 +131,56 @@ the server exposes a different count, pass the corresponding IDs to
 `run_fourind_bestval_multigpu.sh`. Set `SIMPLENET_KEEP_CONTAINER=1` only when a
 persistent named debugging container is needed; otherwise all experiment state
 is already external to the container.
+
+## Persistent Docker Compose container
+
+`docker-compose.yml` is intended to reside at
+`/home/vision/dongjun/SimpleNet/docker-compose.yml`. It preserves the existing
+server mount convention:
+
+```text
+/home/vision/dongjun  ->  /workspace
+```
+
+Consequently the repository is visible inside the container at
+`/workspace/SimpleNet`, which is also the configured working directory. Build
+and create the persistent container with:
+
+```bash
+cd /home/vision/dongjun/SimpleNet
+docker compose config
+docker compose build simplenet
+docker compose up --detach simplenet
+```
+
+Check GPU access and open a shell:
+
+```bash
+docker compose exec simplenet nvidia-smi
+docker compose exec simplenet bash
+```
+
+The shared-memory limit defaults to 64 GiB and can be changed without editing
+the YAML. To preserve the old 480 GiB setting:
+
+```bash
+cd /home/vision/dongjun/SimpleNet
+SIMPLENET_SHM_SIZE=480g docker compose up --detach --build simplenet
+```
+
+After Dockerfile or requirements changes, recreate the service with:
+
+```bash
+docker compose up --detach --build --force-recreate simplenet
+```
+
+Normal lifecycle commands are:
+
+```bash
+docker compose stop simplenet
+docker compose start simplenet
+docker compose down
+```
+
+`down` removes the Compose container and network, but it does not delete the
+host files under `/home/vision/dongjun` or the built image.

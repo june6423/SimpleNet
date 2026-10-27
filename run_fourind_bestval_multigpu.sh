@@ -4,8 +4,8 @@ set -uo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 python_bin="${PYTHON_BIN:-python3}"
 data_root="${1:-${FOURIND_DATA_ROOT:-}}"
-results_root="${2:-${script_dir}/results_fourind_bestval}"
-gpu_csv="${3:-0,1,2}"
+results_root="${2:-${FOURIND_RESULTS_ROOT:-${script_dir}/results_fourind_bestval}}"
+gpu_csv="${3:-${FOURIND_GPU_CSV:-0,1,2}}"
 split_strategy="${FOURIND_SPLIT_STRATEGY:-chronological}"
 
 if [[ -z "$data_root" ]]; then
@@ -17,6 +17,16 @@ if [[ ! -d "$data_root" ]]; then
     printf 'Dataset root does not exist: %s\n' "$data_root" >&2
     exit 2
 fi
+
+data_root="$(realpath -e -- "$data_root")"
+results_root="$(realpath -m -- "$results_root")"
+case "$results_root/" in
+    "$data_root/"*)
+        printf 'Results root must be outside the dataset root: data=%s results=%s\n' \
+            "$data_root" "$results_root" >&2
+        exit 2
+        ;;
+esac
 
 IFS=',' read -r -a gpus <<<"$gpu_csv"
 if [[ ${#gpus[@]} -ne 3 ]]; then

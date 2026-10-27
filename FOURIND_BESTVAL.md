@@ -43,8 +43,13 @@ The dataset root may instead be supplied through `FOURIND_DATA_ROOT`:
 
 ```bash
 FOURIND_DATA_ROOT=/server/path/to/4ind_dataset_202608 \
-  ./run_fourind_bestval_multigpu.sh "" /server/path/to/results 0,1,2
+FOURIND_RESULTS_ROOT=/server/path/to/results \
+FOURIND_GPU_CSV=0,1,2 \
+  ./run_fourind_bestval_multigpu.sh
 ```
+
+The launcher rejects a results directory placed inside the dataset root, so
+generated manifests, logs, and checkpoints cannot be scanned as input data.
 
 ### Date-mixed re-experiment
 
@@ -55,11 +60,11 @@ capture dates and source blocks.  Model, augmentation, input, training, and
 best-validation settings are unchanged.
 
 ```bash
+FOURIND_DATA_ROOT=/workspace/4ind \
+FOURIND_RESULTS_ROOT=/workspace/SimpleNet/4ind_result_date_mixed \
+FOURIND_GPU_CSV=2,3,4 \
 FOURIND_SPLIT_STRATEGY=date-mixed \
-  ./run_fourind_bestval_multigpu.sh \
-  /workspace/4ind \
-  /workspace/SimpleNet/4ind_result_date_mixed \
-  2,3,4
+  ./run_fourind_bestval_multigpu.sh
 ```
 
 Use a new results directory.  The launcher records the strategy in
