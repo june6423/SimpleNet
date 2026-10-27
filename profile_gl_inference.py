@@ -10,6 +10,13 @@ With ``--variant NAME`` the script profiles one global-local inference variant
 (fp16 autocast, channels_last, tile batch size, tile stride) and writes
 ``variants/NAME.json``.  ``--merge-variants`` compares the variant scores with
 the first variant and writes ``variants_<category>.json``.
+
+With ``--variant NAME --substages`` the script also times the sub-stages S1 to
+S8 of ``local_backbone_heads`` (forward hooks on the existing modules and a
+wrapper of ``patch_maker.patchify``), writes ``substages/NAME.json``, and
+writes the top CUDA kernels of a ``torch.profiler`` pass to
+``torch_profiler_NAME_top30.txt``.  ``--merge-substages`` writes
+``substages_<category>.json``.
 """
 
 from __future__ import annotations
@@ -49,6 +56,9 @@ STAGES = (
     "end_to_end",
 )
 
+# Sub-stages of local_backbone_heads, in the order of the calls.
+SUBSTAGES = ("S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -78,6 +88,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-variants",
         help="Comma-separated variant names.  The first one is the reference.",
+    )
+    parser.add_argument(
+        "--substages", action="store_true",
+        help="With --variant, time the sub-stages S1 to S8 and run torch.profiler.",
+    )
+    parser.add_argument("--profiler-images", type=int, default=3)
+    parser.add_argument(
+        "--merge-substages",
+        help="Comma-separated substage variant names.  The first one is the reference.",
     )
     return parser.parse_args()
 
@@ -167,6 +186,98 @@ def branch_score_maps(model, images: torch.Tensor, branch: str, autocast: bool) 
     )
 
 
+def describe(output) -> object:
+    """Shape and dtype of a tensor, or of each tensor in a dict."""
+    if isinstance(output, dict):
+        return {key: describe(value) for key, value in output.items()}
+    return {"shape": list(output.shape), "dtype": str(output.dtype)}
+
+
+class SubstageRecorder:
+    """Time the sub-stages S1 to S8 of each local tile batch at synchronized marks.
+
+    The marks split the local pass into contiguous intervals, so the sub-stage
+    times sum to the time of the pass.  S1 starts with the tile batch; S1 to S8
+    end at: the uploaded tile batch (S1), the feature_aggregator output (S2),
+    the last ``patchify`` output (S3), the preprocessing input (S4), the
+    preadapt_aggregator output (S5), the pre_projection output (S6), the score
+    grid (S7), and the ``_score_maps_from_grid`` output (S8).  The hooks return
+    None and the wrapper returns the ``patchify`` output, so no value changes.
+    The marks are taken only for the local tile batches.
+    """
+
+    def __init__(self, model):
+        self.device = model.device
+        self.active = False
+        self.first_batch = True
+        self.marks: Dict[str, float] = {}
+        self.image = dict.fromkeys(SUBSTAGES, 0.0)
+        self.shapes: Dict[str, object] = {}
+        modules = model.forward_modules
+        modules["feature_aggregator"].register_forward_hook(self._after("S2"))
+        modules["preprocessing"].register_forward_pre_hook(self._before_preprocessing)
+        modules["preadapt_aggregator"].register_forward_hook(self._after("S5"))
+        model.pre_projection.register_forward_hook(self._after("S6"))
+        patchify = model.patch_maker.patchify
+
+        def timed_patchify(*args, **kwargs):
+            output = patchify(*args, **kwargs)
+            if self.active:
+                self.mark("S3")
+                if self.first_batch:
+                    self.shapes.setdefault("S3", []).append(describe(output[0]))
+            return output
+
+        model.patch_maker.patchify = timed_patchify
+
+    def mark(self, name: str) -> None:
+        synchronize(self.device)
+        self.marks[name] = time.perf_counter()
+
+    def _after(self, name: str):
+        def hook(_module, _inputs, output):
+            if self.active:
+                self.mark(name)
+                if self.first_batch:
+                    self.shapes[name] = describe(output)
+        return hook
+
+    def _before_preprocessing(self, _module, _inputs):
+        if self.active:
+            self.mark("S4")
+
+    def local_score_maps(self, model, tile_batch: torch.Tensor, autocast: bool,
+                         start: float) -> torch.Tensor:
+        """``branch_score_maps(model, tile_batch, "local", autocast)`` with the marks."""
+        self.marks = {"start": start}
+        self.mark("S1")
+        self.active = True
+        if autocast:
+            with torch.autocast("cuda", dtype=torch.float16):
+                raw_grid = model._raw_score_grid(tile_batch, "local")
+            score_grid = raw_grid.float()
+        else:
+            raw_grid = score_grid = model._raw_score_grid(tile_batch, "local")
+        self.active = False
+        self.mark("S7")
+        maps = model._score_maps_from_grid(
+            score_grid, tile_batch.shape[-2:], "local", normalize=True
+        )
+        self.mark("S8")
+        if self.first_batch:
+            self.shapes["S7"] = describe(raw_grid)
+            self.first_batch = False
+        previous = "start"
+        for name in SUBSTAGES:
+            self.image[name] += self.marks[name] - self.marks[previous]
+            previous = name
+        return maps
+
+    def pop_image(self) -> Dict[str, float]:
+        image, self.image = self.image, dict.fromkeys(SUBSTAGES, 0.0)
+        return image
+
+
 @torch.inference_mode()
 def timed_predict_highres_item(
     model,
@@ -174,13 +285,15 @@ def timed_predict_highres_item(
     timings: List[Dict[str, float]],
     autocast: bool = False,
     channels_last: bool = False,
+    recorder: SubstageRecorder = None,
 ):
     """``GlobalLocalSimpleNet._predict_highres_item`` with a timer per stage.
 
     The arithmetic is the same as ``_predict_highres_item`` and
     ``_stitch_local_maps``.  The global upsample moves into the fusion stage;
     it does not depend on the local map.  ``autocast`` and ``channels_last``
-    change only the backbone and head passes.
+    change only the backbone and head passes.  With ``recorder``, the local
+    pass also records the sub-stages S1 to S8.
     """
     device = model.device
     model._set_inference_mode()
@@ -221,7 +334,10 @@ def timed_predict_highres_item(
             tile_batch = (tile_batch - mean) / std
         if channels_last:
             tile_batch = tile_batch.contiguous(memory_format=torch.channels_last)
-        tile_maps = branch_score_maps(model, tile_batch, "local", autocast)
+        if recorder is None:
+            tile_maps = branch_score_maps(model, tile_batch, "local", autocast)
+        else:
+            tile_maps = recorder.local_score_maps(model, tile_batch, autocast, start)
         synchronize(device)
         backbone_heads += time.perf_counter() - start
 
@@ -268,11 +384,14 @@ def timed_predict_highres_item(
             "tiles": int(len(local_tiles)),
         }
     )
+    if recorder is not None:
+        timings[-1].update(recorder.pop_image())
     return image_score, anomaly_map
 
 
 def run_global_local(
-    model, loader, instrumented: bool, autocast: bool = False, channels_last: bool = False
+    model, loader, instrumented: bool, autocast: bool = False, channels_last: bool = False,
+    recorder: SubstageRecorder = None,
 ) -> List[Dict[str, float]]:
     """Run the unchanged ``_iter_predictions`` loop once over ``loader``."""
     timed_loader = TimedLoader(loader)
@@ -284,6 +403,7 @@ def run_global_local(
             timings=timings,
             autocast=autocast,
             channels_last=channels_last,
+            recorder=recorder,
         )
     else:
         model.__dict__.pop("_predict_highres_item", None)
@@ -386,6 +506,76 @@ def stage_summary(rows: List[Dict[str, float]], warmup: int) -> Dict[str, object
     }
 
 
+def substage_summary(rows: List[Dict[str, float]], warmup: int) -> Dict[str, object]:
+    measured = rows[warmup:]
+    substages = {name: summary_ms([row[name] for row in measured]) for name in SUBSTAGES}
+    whole = summary_ms([row["local_backbone_heads"] for row in measured])["mean"]
+    total = sum(substages[name]["mean"] for name in SUBSTAGES)
+    return {
+        "substages_ms": substages,
+        "share_of_local_backbone_heads": {
+            name: substages[name]["mean"] / whole for name in SUBSTAGES
+        },
+        "sum_mean_substages_ms": total,
+        "sum_substages_over_local_backbone_heads": total / whole,
+    }
+
+
+def write_profiler_top30(model, dataset, cli, path: Path) -> None:
+    """Run ``torch.profiler`` on the first measured images; write the top 30 CUDA kernels."""
+    start = cli.warmup_images
+    dataset.records = dataset.records[start:start + cli.profiler_images]
+    loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
+    activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    with torch.profiler.profile(activities=activities) as profiler:
+        run_global_local(
+            model, loader, instrumented=True,
+            autocast=cli.autocast, channels_last=cli.channels_last,
+        )
+    kernels = [
+        event for event in profiler.key_averages()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    kernels.sort(key=lambda event: event.self_device_time_total, reverse=True)
+    total_us = sum(event.self_device_time_total for event in kernels)
+    lines = [
+        f"variant {cli.variant}: top 30 CUDA kernels by total time over "
+        f"{len(dataset.records)} images (images {start} to {start + len(dataset.records) - 1})",
+        f"all CUDA kernels: {len(kernels)} names, {total_us / 1000:.3f} ms",
+        "",
+        f"{'rank':>4}  {'total_ms':>10}  {'share_%':>7}  {'calls':>6}  {'mean_us':>9}  kernel",
+    ]
+    for rank, event in enumerate(kernels[:30], start=1):
+        lines.append(
+            f"{rank:>4}  {event.self_device_time_total / 1000:>10.3f}  "
+            f"{100 * event.self_device_time_total / total_us:>7.2f}  {event.count:>6}  "
+            f"{event.self_device_time_total / event.count:>9.1f}  {event.key}"
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def merge_substages(output_dir: Path, names: List[str], category: str) -> None:
+    """Add the speed-up of each sub-stage over the first configuration; write substages_<category>.json."""
+    configurations = {
+        name: json.loads((output_dir / "substages" / f"{name}.json").read_text(encoding="utf-8"))
+        for name in names
+    }
+    reference = configurations[names[0]]
+    for data in configurations.values():
+        data["speedup_against_reference"] = {
+            name: reference["substages_ms"][name]["mean"] / data["substages_ms"][name]["mean"]
+            for name in SUBSTAGES
+        }
+        data["speedup_against_reference"]["local_backbone_heads"] = (
+            reference["stages_ms"]["local_backbone_heads"]["mean"]
+            / data["stages_ms"]["local_backbone_heads"]["mean"]
+        )
+    write_json(
+        output_dir / f"substages_{category}.json",
+        {"category": category, "reference": names[0], "configurations": configurations},
+    )
+
+
 def write_or_check_images(path: Path, image_paths: List[str]) -> None:
     """Write the image list, or check it against the list that is already there."""
     if path.exists():
@@ -417,15 +607,29 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
     loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
     if cli.nvidia_smi_start:
         write_nvidia_smi(output_dir / "nvidia-smi-start.txt")
+    recorder = SubstageRecorder(model) if cli.substages else None
 
     torch.cuda.reset_peak_memory_stats(device)
     load_start = host_load()
     rows = run_global_local(
         model, loader, instrumented=True,
-        autocast=cli.autocast, channels_last=cli.channels_last,
+        autocast=cli.autocast, channels_last=cli.channels_last, recorder=recorder,
     )
     load_end = host_load()
-    variants_dir = output_dir / "variants"
+    substages = {}
+    if recorder is not None:
+        substages = {
+            **substage_summary(rows, cli.warmup_images),
+            "tensor_shapes": recorder.shapes,
+            "timed_run_max_memory_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+            "timed_run_max_memory_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20,
+            "profiler_images": cli.profiler_images,
+        }
+        # The peak memory below then also covers the profiler pass.
+        write_profiler_top30(
+            model, dataset, cli, output_dir / f"torch_profiler_{cli.variant}_top30.txt"
+        )
+    variants_dir = output_dir / ("substages" if cli.substages else "variants")
     variants_dir.mkdir(exist_ok=True)
     write_json(
         variants_dir / f"{cli.variant}.json",
@@ -442,6 +646,7 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
             "image_count": len(rows),
             "warmup_images": cli.warmup_images,
             **stage_summary(rows, cli.warmup_images),
+            **substages,
             "max_memory_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
             "max_memory_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20,
             "scores": [row["score"] for row in rows],
@@ -554,6 +759,9 @@ def main() -> None:
     output_dir = Path(cli.output_dir)
     if cli.merge_variants:
         merge_variants(output_dir, cli.merge_variants.split(","), cli.category)
+        return
+    if cli.merge_substages:
+        merge_substages(output_dir, cli.merge_substages.split(","), cli.category)
         return
     if not torch.cuda.is_available():
         raise RuntimeError("Profiling requires a CUDA GPU.")
