@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import os
 import statistics
 import subprocess
 import time
@@ -53,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-images", type=int, default=5)
     parser.add_argument("--baseline-batch-sizes", default="1,8")
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-threads", type=int, default=4)
     return parser.parse_args()
 
 
@@ -68,6 +70,32 @@ def write_json(path: Path, payload: Dict[str, object]) -> None:
 def write_nvidia_smi(path: Path) -> None:
     done = subprocess.run(["nvidia-smi"], capture_output=True, text=True)
     path.write_text(done.stdout + done.stderr, encoding="utf-8")
+
+
+def host_load() -> Dict[str, object]:
+    """Record the CPU load, the thread settings, and the use of the visible GPU."""
+    gpu_index = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    gpu = subprocess.run(
+        [
+            "nvidia-smi",
+            "-i",
+            gpu_index,
+            "--query-gpu=index,utilization.gpu,memory.used",
+            "--format=csv,noheader",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    nproc = subprocess.run(["nproc"], capture_output=True, text=True)
+    return {
+        "unix_time": time.time(),
+        "loadavg": Path("/proc/loadavg").read_text(encoding="utf-8").strip(),
+        "nproc": nproc.stdout.strip(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
+        "torch_num_threads": torch.get_num_threads(),
+        "gpu": (gpu.stdout + gpu.stderr).strip(),
+    }
 
 
 def summary_ms(values: List[float]) -> Dict[str, float]:
@@ -288,6 +316,7 @@ def main() -> None:
     cli = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("Profiling requires a CUDA GPU.")
+    torch.set_num_threads(cli.num_threads)
     device = torch.device("cuda:0")
     output_dir = Path(cli.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -310,8 +339,10 @@ def main() -> None:
     loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
     write_nvidia_smi(output_dir / "nvidia-smi-start.txt")
 
+    load_start = host_load()
     unchanged = run_global_local(model, loader, instrumented=False)
     instrumented = run_global_local(model, loader, instrumented=True)
+    load_end = host_load()
     unchanged_scores = [row["score"] for row in unchanged]
     instrumented_scores = [row["score"] for row in instrumented]
     write_json(
@@ -355,6 +386,8 @@ def main() -> None:
                 [row["model_total"] for row in unchanged[warmup:]]
             ),
             "recorded_test_seconds_per_image": job_result["test_seconds_per_image"],
+            "host_load_start": load_start,
+            "host_load_end": load_end,
             "per_image_seconds": instrumented,
         },
     )
@@ -372,6 +405,7 @@ def main() -> None:
         if [record.image_path for record in dataset.records] != image_paths:
             raise ValueError(f"The {method} images differ from the global-local images.")
         by_batch_size = {}
+        load_start = host_load()
         for batch_size in batch_sizes:
             loader = build_loader(dataset, batch_size, cli.num_workers, shuffle=False)
             rows = run_baseline(model, loader, device)
@@ -396,6 +430,7 @@ def main() -> None:
                 "per_batch_seconds": rows,
             }
             del loader
+        load_end = host_load()
         write_json(
             output_dir / f"{output_name}_{cli.category}.json",
             {
@@ -408,6 +443,8 @@ def main() -> None:
                 "warmup_images": warmup,
                 "num_workers": cli.num_workers,
                 "recorded_test_seconds_per_image": job_result["test_seconds_per_image"],
+                "host_load_start": load_start,
+                "host_load_end": load_end,
                 **by_batch_size,
             },
         )

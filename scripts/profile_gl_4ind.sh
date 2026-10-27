@@ -22,4 +22,5 @@ cd "$repo_dir"
     --image-count 100 \
     --warmup-images 5 \
     --baseline-batch-sizes "${BASELINE_BATCH_SIZES:-1,8}" \
-    --num-workers 4
+    --num-workers 4 \
+    --num-threads 4
