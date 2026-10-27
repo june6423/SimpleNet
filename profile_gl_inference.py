@@ -22,6 +22,11 @@ writes the top CUDA kernels of a ``torch.profiler`` pass to
 on the model instance.  ``--tensor-check`` compares the ``_embed`` output with
 the flag off and on, ``--s4fix-baselines`` profiles the baselines with the flag
 off and on, and ``--merge-s4fix`` writes ``s4fix_<category>.json``.
+
+``--s4-mode`` and ``--s4-fp16`` set ``feature_interpolation_mode`` and
+``feature_interpolation_fp16`` on the model instance.  ``--interp-tensor-check``
+compares the ``_embed`` output of the three modes, and ``--merge-interp``
+writes ``interp_<category>.json``.
 """
 
 from __future__ import annotations
@@ -119,6 +124,22 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--merge-s4fix",
+        help="Comma-separated substage variant names.  The first one is the reference.",
+    )
+    parser.add_argument(
+        "--s4-mode", choices=("old", "channels_last", "before_unfold"), default="old",
+        help="With --variant, set feature_interpolation_mode on the model instance.",
+    )
+    parser.add_argument(
+        "--s4-fp16", action="store_true",
+        help="With --variant, set feature_interpolation_fp16 on the model instance.",
+    )
+    parser.add_argument(
+        "--interp-tensor-check", action="store_true",
+        help="Compare the _embed output of the three S4 modes; write interp_tensor_check.json.",
+    )
+    parser.add_argument(
+        "--merge-interp",
         help="Comma-separated substage variant names.  The first one is the reference.",
     )
     return parser.parse_args()
@@ -600,21 +621,24 @@ def merge_substages(output_dir: Path, names: List[str], category: str) -> None:
     )
 
 
-def merge_s4fix(output_dir: Path, names: List[str], category: str) -> None:
-    """Compare each configuration with the first one; write s4fix_<category>.json."""
+def merge_s4fix(output_dir: Path, names: List[str], category: str, prefix: str = "s4fix") -> None:
+    """Compare each configuration with the first one; write <prefix>_<category>.json."""
     configurations = {
         name: json.loads((output_dir / "substages" / f"{name}.json").read_text(encoding="utf-8"))
         for name in names
     }
     reference = configurations[names[0]]
     reference_scores = np.asarray(reference["scores"])
+    reference_ranks = stats.rankdata(reference_scores, method="ordinal")
     for data in configurations.values():
         scores = np.asarray(data["scores"])
+        ranks = stats.rankdata(scores, method="ordinal")
         data["against_reference"] = {
             "reference": names[0],
             "max_abs_score_diff": float(np.max(np.abs(scores - reference_scores))),
             "pearson": float(stats.pearsonr(reference_scores, scores)[0]),
             "spearman": float(stats.spearmanr(reference_scores, scores)[0]),
+            "images_with_rank_change_over_5": int(np.sum(np.abs(ranks - reference_ranks) > 5)),
             "speedup_model_total": (
                 reference["stages_ms"]["model_total"]["mean"]
                 / data["stages_ms"]["model_total"]["mean"]
@@ -629,7 +653,7 @@ def merge_s4fix(output_dir: Path, names: List[str], category: str) -> None:
             },
         }
     write_json(
-        output_dir / f"s4fix_{category}.json",
+        output_dir / f"{prefix}_{category}.json",
         {"category": category, "reference": names[0], "configurations": configurations},
     )
 
@@ -698,6 +722,93 @@ def tensor_check(cli, device: torch.device, output_dir: Path, results_root: Path
             "max_patchify_layer2_abs_diff": max(
                 check["patchify_layer2_max_abs_diff"] for check in checks
             ),
+        },
+    )
+    del model
+    torch.cuda.empty_cache()
+
+
+@torch.inference_mode()
+def interp_tensor_check(cli, device: torch.device, output_dir: Path, results_root: Path,
+                        manifest_sha256: str, images: int = 3, border: int = 3) -> None:
+    """Run ``_embed`` in fp32 on the first tile batch of measured images in the three S4 modes.
+
+    Each mode is compared with the old mode over all elements and over the
+    interior patch positions (``border`` rows and columns left out on each side
+    of the patch grid).  The layer2 ``patchify`` output is the control.
+    """
+    args, job_dir, job_result = job_args(
+        results_root, "global_local", cli.category, cli.data_root, cli.manifest_path
+    )
+    if job_result["manifest_sha256"] != manifest_sha256:
+        raise ValueError("The manifest differs from the one in job_result.json.")
+    model, dataset, checkpoint = load_job(args, job_dir, cli.image_count, device)
+    write_or_check_images(
+        output_dir / f"images_{cli.category}.txt",
+        [record.image_path for record in dataset.records],
+    )
+    model._set_inference_mode()
+    modes = ("old", "channels_last", "before_unfold")
+    checks = []
+    for index in range(cli.warmup_images, cli.warmup_images + images):
+        tile_batch = dataset[index]["local_tiles"][: model.tile_batch_size]
+        # The upload and normalization of timed_predict_highres_item.
+        if tile_batch.dtype == torch.uint8:
+            tile_batch = tile_batch.to(device, dtype=torch.float32).div_(255.0)
+            mean = tile_batch.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
+            std = tile_batch.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
+            tile_batch = (tile_batch - mean) / std
+        embedded = {}
+        layer2 = {}
+        for mode in modes:
+            model.feature_interpolation_mode = mode
+            embedded[mode], patch_shapes = model._embed(
+                tile_batch, provide_patch_shapes=True, evaluation=True
+            )
+            features = model.forward_modules["feature_aggregator"](tile_batch)
+            layer2[mode] = model.patch_maker.patchify(features["layer2"])
+        model.feature_interpolation_mode = "old"
+        grid_h, grid_w = patch_shapes[0]
+        check = {
+            "image_index": index,
+            "image_path": dataset.records[index].image_path,
+            "tiles": int(tile_batch.shape[0]),
+            "embed_dtype": str(embedded["old"].dtype),
+            "patch_grid": [grid_h, grid_w],
+            "interior_rows": [border, grid_h - border - 1],
+            "interior_cols": [border, grid_w - border - 1],
+        }
+        old = embedded["old"]
+        # The _embed rows are ordered (tile, row * grid_w + col).
+        old_grid = old.reshape(-1, grid_h, grid_w, old.shape[-1])
+        for mode in modes:
+            output = embedded[mode]
+            check[mode] = {"embed_shape": list(output.shape)}
+            if output.shape != old.shape:
+                continue
+            difference = (output - old).abs()
+            interior = difference.reshape(old_grid.shape)[
+                :, border:grid_h - border, border:grid_w - border
+            ]
+            check[mode].update(
+                {
+                    "max_abs_diff_all": float(difference.max()),
+                    "max_abs_diff_interior": float(interior.max()),
+                    "patchify_layer2_shape": list(layer2[mode].shape),
+                    "patchify_layer2_max_abs_diff": float(
+                        (layer2[mode] - layer2["old"]).abs().max()
+                    ),
+                }
+            )
+        checks.append(check)
+    write_json(
+        output_dir / "interp_tensor_check.json",
+        {
+            "category": cli.category,
+            "checkpoint": str(checkpoint),
+            **environment(device),
+            "reference_mode": "old",
+            "checks": checks,
         },
     )
     del model
@@ -789,6 +900,10 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
     )
     if cli.fast_interp:
         model.fast_feature_interpolation = True
+    if cli.s4_mode != "old":
+        model.feature_interpolation_mode = cli.s4_mode
+    if cli.s4_fp16:
+        model.feature_interpolation_fp16 = True
     if cli.channels_last:
         model.backbone.to(memory_format=torch.channels_last)
     loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
@@ -826,6 +941,8 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
             "autocast_fp16": cli.autocast,
             "channels_last": cli.channels_last,
             "fast_feature_interpolation": model.fast_feature_interpolation,
+            "s4_mode": model.feature_interpolation_mode,
+            "s4_dtype": "fp16" if model.feature_interpolation_fp16 else "fp32",
             "tile_batch_size": model.tile_batch_size,
             "tile_stride": [args.tile_stride_y, args.tile_stride_x],
             "tile_counts": sorted({row["tiles"] for row in rows}),
@@ -955,6 +1072,9 @@ def main() -> None:
     if cli.merge_s4fix:
         merge_s4fix(output_dir, cli.merge_s4fix.split(","), cli.category)
         return
+    if cli.merge_interp:
+        merge_s4fix(output_dir, cli.merge_interp.split(","), cli.category, prefix="interp")
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("Profiling requires a CUDA GPU.")
     torch.set_num_threads(cli.num_threads)
@@ -967,6 +1087,9 @@ def main() -> None:
         return
     if cli.tensor_check:
         tensor_check(cli, device, output_dir, results_root, manifest_sha256)
+        return
+    if cli.interp_tensor_check:
+        interp_tensor_check(cli, device, output_dir, results_root, manifest_sha256)
         return
     if cli.s4fix_baselines:
         profile_baselines_s4fix(cli, device, output_dir, results_root, manifest_sha256)

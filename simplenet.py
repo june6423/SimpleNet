@@ -100,6 +100,13 @@ class TBWrapper:
 class SimpleNet(torch.nn.Module):
     # True: _embed interpolates the layer3 patches in one call on a contiguous tensor.
     fast_feature_interpolation = False
+    # How _embed brings layer3 to the layer2 patch grid: "old", "channels_last"
+    # (the one-call path on a channels_last tensor), or "before_unfold"
+    # (interpolate the layer3 map, then unfold it with dilation).  A mode other
+    # than "old" takes precedence over fast_feature_interpolation.
+    feature_interpolation_mode = "old"
+    # True: the interpolation of the channels_last and before_unfold modes runs in fp16.
+    feature_interpolation_fp16 = False
 
     def __init__(self, device):
         """anomaly detection class."""
@@ -248,6 +255,41 @@ class SimpleNet(torch.nn.Module):
                 B, L, C = feat.shape
                 features[i] = feat.reshape(B, int(math.sqrt(L)), int(math.sqrt(L)), C).permute(0, 3, 1, 2)
 
+        def interpolate_to(x, size, dtype):
+            """Bilinear resize for the channels_last and before_unfold modes."""
+            if not self.feature_interpolation_fp16:
+                return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+            # Autocast would run upsample_bilinear2d in fp32.
+            with torch.autocast("cuda", enabled=False):
+                x = F.interpolate(x.half(), size=size, mode="bilinear", align_corners=False)
+            return x.to(dtype)
+
+        if self.feature_interpolation_mode == "before_unfold":
+            # Interpolate each deeper layer map to the layer2 patch grid, then
+            # unfold it with dilation d = ref / p, which keeps the 3 x 3
+            # neighbours at the layer spacing.  Expected to equal the old path
+            # except near the border, where the old path interpolates the zero
+            # padding.
+            layer2, ref_num_patches = self.patch_maker.patchify(
+                features[0], return_spatial_info=True
+            )
+            patch_shapes = [ref_num_patches]
+            unfolded = [layer2]
+            size = self.patch_maker.patchsize
+            for x in features[1:]:
+                patch_shapes.append(list(x.shape[-2:]))
+                dilation = ref_num_patches[0] // x.shape[-2]
+                x = x.contiguous(memory_format=torch.channels_last)
+                x = interpolate_to(x, (ref_num_patches[0], ref_num_patches[1]), layer2.dtype)
+                x = F.unfold(x, kernel_size=size, stride=1, dilation=dilation, padding=dilation)
+                # The layout of patch_maker.patchify: (B, L, C, size, size).
+                x = x.reshape(len(x), -1, size, size, x.shape[-1]).permute(0, 4, 1, 2, 3)
+                unfolded.append(x)
+            features = [x.reshape(-1, *x.shape[-3:]) for x in unfolded]
+            features = self.forward_modules["preprocessing"](features)
+            features = self.forward_modules["preadapt_aggregator"](features)
+            return features, patch_shapes
+
         features = [
             self.patch_maker.patchify(x, return_spatial_info=True) for x in features
         ]
@@ -258,6 +300,23 @@ class SimpleNet(torch.nn.Module):
         for i in range(1, len(features)):
             _features = features[i]
             patch_dims = patch_shapes[i]
+
+            if self.feature_interpolation_mode == "channels_last":
+                # The fast_feature_interpolation path below on a channels_last
+                # tensor; same values and element order as the old path.
+                patch_shape = _features.shape[-3:]
+                _features = _features.reshape(
+                    _features.shape[0], patch_dims[0], patch_dims[1], -1
+                )
+                _features = _features.permute(0, 3, 1, 2).contiguous(
+                    memory_format=torch.channels_last
+                )
+                _features = interpolate_to(
+                    _features, (ref_num_patches[0], ref_num_patches[1]), features[0].dtype
+                )
+                _features = _features.permute(0, 2, 3, 1)
+                features[i] = _features.reshape(len(_features), -1, *patch_shape)
+                continue
 
             if self.fast_feature_interpolation:
                 # Same values and element order as the path below: the
