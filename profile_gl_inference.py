@@ -5,6 +5,11 @@ This script does not modify the model files.  It rebuilds each model from the
 inference on the first test images of the job manifest.  The global-local
 stages are timed by an instance-level wrapper of ``_predict_highres_item``;
 the unchanged ``_iter_predictions`` loop still records ``model_total``.
+
+With ``--variant NAME`` the script profiles one global-local inference variant
+(fp16 autocast, channels_last, tile batch size, tile stride) and writes
+``variants/NAME.json``.  ``--merge-variants`` compares the variant scores with
+the first variant and writes ``variants_<category>.json``.
 """
 
 from __future__ import annotations
@@ -19,8 +24,10 @@ import time
 from pathlib import Path
 from typing import Dict, List
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy import stats
 
 import utils
 from fourind_bestval_benchmark import (
@@ -55,6 +62,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline-batch-sizes", default="1,8")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--num-threads", type=int, default=4)
+    parser.add_argument("--variant", help="Profile one global-local variant under this name.")
+    parser.add_argument("--autocast", action="store_true", help="fp16 autocast for backbone and heads.")
+    parser.add_argument("--channels-last", action="store_true")
+    parser.add_argument("--tile-batch-size", type=int, help="Default: the value in args.json.")
+    parser.add_argument("--tile-stride", type=int, help="Default: the values in args.json.")
+    parser.add_argument(
+        "--nvidia-smi-start", action="store_true",
+        help="With --variant, write nvidia-smi-start.txt after the model is on the GPU.",
+    )
+    parser.add_argument(
+        "--baselines-only", action="store_true",
+        help="Profile only the baselines on the images of images_<category>.txt.",
+    )
+    parser.add_argument(
+        "--merge-variants",
+        help="Comma-separated variant names.  The first one is the reference.",
+    )
     return parser.parse_args()
 
 
@@ -127,23 +151,48 @@ class TimedLoader:
             yield item
 
 
+def branch_score_maps(model, images: torch.Tensor, branch: str, autocast: bool) -> torch.Tensor:
+    """``_score_maps(images, branch, normalize=True)``, optionally under fp16 autocast.
+
+    With autocast, the backbone and the head run in fp16.  The score grid is
+    cast to float32 before the upsample and the median/MAD normalization.
+    """
+    if not autocast:
+        return model._score_maps(images, branch, normalize=True)
+    with torch.autocast("cuda", dtype=torch.float16):
+        score_grid = model._raw_score_grid(images, branch)
+    return model._score_maps_from_grid(
+        score_grid.float(), images.shape[-2:], branch, normalize=True
+    )
+
+
 @torch.inference_mode()
-def timed_predict_highres_item(model, data_item, timings: List[Dict[str, float]]):
+def timed_predict_highres_item(
+    model,
+    data_item,
+    timings: List[Dict[str, float]],
+    autocast: bool = False,
+    channels_last: bool = False,
+):
     """``GlobalLocalSimpleNet._predict_highres_item`` with a timer per stage.
 
     The arithmetic is the same as ``_predict_highres_item`` and
     ``_stitch_local_maps``.  The global upsample moves into the fusion stage;
-    it does not depend on the local map.
+    it does not depend on the local map.  ``autocast`` and ``channels_last``
+    change only the backbone and head passes.
     """
     device = model.device
     model._set_inference_mode()
     original_size = model._original_size_from_batch(data_item)
+    global_image = data_item["global_image"]
     local_tiles = data_item["local_tiles"]
     tile_boxes = data_item["tile_boxes"]
+    if channels_last:
+        global_image = global_image.contiguous(memory_format=torch.channels_last)
 
     synchronize(device)
     start = time.perf_counter()
-    global_map = model._score_maps(data_item["global_image"], "global", normalize=True)
+    global_map = branch_score_maps(model, global_image, "global", autocast)
     synchronize(device)
     global_branch = time.perf_counter() - start
 
@@ -169,7 +218,9 @@ def timed_predict_highres_item(model, data_item, timings: List[Dict[str, float]]
             mean = tile_batch.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
             std = tile_batch.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
             tile_batch = (tile_batch - mean) / std
-        tile_maps = model._score_maps(tile_batch, "local", normalize=True)
+        if channels_last:
+            tile_batch = tile_batch.contiguous(memory_format=torch.channels_last)
+        tile_maps = branch_score_maps(model, tile_batch, "local", autocast)
         synchronize(device)
         backbone_heads += time.perf_counter() - start
 
@@ -219,13 +270,19 @@ def timed_predict_highres_item(model, data_item, timings: List[Dict[str, float]]
     return image_score, anomaly_map
 
 
-def run_global_local(model, loader, instrumented: bool) -> List[Dict[str, float]]:
+def run_global_local(
+    model, loader, instrumented: bool, autocast: bool = False, channels_last: bool = False
+) -> List[Dict[str, float]]:
     """Run the unchanged ``_iter_predictions`` loop once over ``loader``."""
     timed_loader = TimedLoader(loader)
     timings: List[Dict[str, float]] = []
     if instrumented:
         model._predict_highres_item = functools.partial(
-            timed_predict_highres_item, model, timings=timings
+            timed_predict_highres_item,
+            model,
+            timings=timings,
+            autocast=autocast,
+            channels_last=channels_last,
         )
     else:
         model.__dict__.pop("_predict_highres_item", None)
@@ -312,20 +369,125 @@ def environment(device: torch.device) -> Dict[str, object]:
     }
 
 
-def main() -> None:
-    cli = parse_args()
-    if not torch.cuda.is_available():
-        raise RuntimeError("Profiling requires a CUDA GPU.")
-    torch.set_num_threads(cli.num_threads)
-    device = torch.device("cuda:0")
-    output_dir = Path(cli.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    results_root = Path(cli.results_root)
-    manifest_sha256 = file_sha256(Path(cli.manifest_path))
-    batch_sizes = [int(value) for value in cli.baseline_batch_sizes.split(",")]
-    warmup = cli.warmup_images
+def stage_summary(rows: List[Dict[str, float]], warmup: int) -> Dict[str, object]:
+    measured = rows[warmup:]
+    stages = {stage: summary_ms([row[stage] for row in measured]) for stage in STAGES}
+    sum_1_to_5 = sum(stages[stage]["mean"] for stage in STAGES[:5])
+    sum_2_to_5 = sum(stages[stage]["mean"] for stage in STAGES[1:5])
+    model_total = stages["model_total"]["mean"]
+    return {
+        "measured_images": len(measured),
+        "stages_ms": stages,
+        "sum_mean_stages_1_to_5_ms": sum_1_to_5,
+        "sum_mean_stages_2_to_5_ms": sum_2_to_5,
+        "sum_1_to_5_over_model_total": sum_1_to_5 / model_total,
+        "sum_2_to_5_over_model_total": sum_2_to_5 / model_total,
+    }
 
-    # Global-local ("Ours").
+
+def write_or_check_images(path: Path, image_paths: List[str]) -> None:
+    """Write the image list, or check it against the list that is already there."""
+    if path.exists():
+        if path.read_text(encoding="utf-8").splitlines() != image_paths:
+            raise ValueError(f"The images differ from {path}.")
+        return
+    path.write_text("\n".join(image_paths) + "\n", encoding="utf-8")
+
+
+def profile_variant(cli, device: torch.device, output_dir: Path, results_root: Path,
+                    manifest_sha256: str) -> None:
+    """Profile one global-local variant with the instrumented path."""
+    args, job_dir, job_result = job_args(
+        results_root, "global_local", cli.category, cli.data_root, cli.manifest_path
+    )
+    if job_result["manifest_sha256"] != manifest_sha256:
+        raise ValueError("The manifest differs from the one in job_result.json.")
+    if cli.tile_batch_size:
+        args.tile_batch_size = cli.tile_batch_size
+    if cli.tile_stride:
+        args.tile_stride_x = args.tile_stride_y = cli.tile_stride
+    model, dataset, checkpoint = load_job(args, job_dir, cli.image_count, device)
+    write_or_check_images(
+        output_dir / f"images_{cli.category}.txt",
+        [record.image_path for record in dataset.records],
+    )
+    if cli.channels_last:
+        model.backbone.to(memory_format=torch.channels_last)
+    loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
+    if cli.nvidia_smi_start:
+        write_nvidia_smi(output_dir / "nvidia-smi-start.txt")
+
+    torch.cuda.reset_peak_memory_stats(device)
+    load_start = host_load()
+    rows = run_global_local(
+        model, loader, instrumented=True,
+        autocast=cli.autocast, channels_last=cli.channels_last,
+    )
+    load_end = host_load()
+    variants_dir = output_dir / "variants"
+    variants_dir.mkdir(exist_ok=True)
+    write_json(
+        variants_dir / f"{cli.variant}.json",
+        {
+            "variant": cli.variant,
+            "autocast_fp16": cli.autocast,
+            "channels_last": cli.channels_last,
+            "tile_batch_size": model.tile_batch_size,
+            "tile_stride": [args.tile_stride_y, args.tile_stride_x],
+            "tile_counts": sorted({row["tiles"] for row in rows}),
+            "checkpoint": str(checkpoint),
+            "manifest_sha256": manifest_sha256,
+            **environment(device),
+            "image_count": len(rows),
+            "warmup_images": cli.warmup_images,
+            **stage_summary(rows, cli.warmup_images),
+            "max_memory_allocated_mib": torch.cuda.max_memory_allocated(device) / 2**20,
+            "max_memory_reserved_mib": torch.cuda.max_memory_reserved(device) / 2**20,
+            "scores": [row["score"] for row in rows],
+            "host_load_start": load_start,
+            "host_load_end": load_end,
+            "per_image_seconds": rows,
+        },
+    )
+
+
+def merge_variants(output_dir: Path, names: List[str], category: str) -> None:
+    """Compare each variant with the first one and write variants_<category>.json."""
+    variants = {
+        name: json.loads((output_dir / "variants" / f"{name}.json").read_text(encoding="utf-8"))
+        for name in names
+    }
+    reference = variants[names[0]]
+    reference_scores = np.asarray(reference["scores"])
+    reference_ranks = stats.rankdata(reference_scores, method="ordinal")
+    for data in variants.values():
+        scores = np.asarray(data["scores"])
+        ranks = stats.rankdata(scores, method="ordinal")
+        data["against_reference"] = {
+            "reference": names[0],
+            "max_abs_score_diff": float(np.max(np.abs(scores - reference_scores))),
+            "pearson": float(stats.pearsonr(reference_scores, scores)[0]),
+            "spearman": float(stats.spearmanr(reference_scores, scores)[0]),
+            "images_with_rank_change_over_5": int(np.sum(np.abs(ranks - reference_ranks) > 5)),
+            "speedup_model_total": (
+                reference["stages_ms"]["model_total"]["mean"]
+                / data["stages_ms"]["model_total"]["mean"]
+            ),
+            "speedup_local_backbone_heads": (
+                reference["stages_ms"]["local_backbone_heads"]["mean"]
+                / data["stages_ms"]["local_backbone_heads"]["mean"]
+            ),
+        }
+    write_json(
+        output_dir / f"variants_{category}.json",
+        {"category": category, "reference": names[0], "variants": variants},
+    )
+
+
+def profile_ours(cli, device: torch.device, output_dir: Path, results_root: Path,
+                 manifest_sha256: str) -> List[str]:
+    """Profile "Ours": one unchanged pass, one instrumented pass, and their consistency."""
+    warmup = cli.warmup_images
     args, job_dir, job_result = job_args(
         results_root, "global_local", cli.category, cli.data_root, cli.manifest_path
     )
@@ -357,11 +519,6 @@ def main() -> None:
         },
     )
 
-    measured = instrumented[warmup:]
-    stages = {stage: summary_ms([row[stage] for row in measured]) for stage in STAGES}
-    sum_1_to_5 = sum(stages[stage]["mean"] for stage in STAGES[:5])
-    sum_2_to_5 = sum(stages[stage]["mean"] for stage in STAGES[1:5])
-    model_total = stages["model_total"]["mean"]
     write_json(
         output_dir / f"ours_{cli.category}.json",
         {
@@ -373,15 +530,10 @@ def main() -> None:
             **environment(device),
             "image_count": len(instrumented),
             "warmup_images": warmup,
-            "measured_images": len(measured),
             "tile_batch_size": model.tile_batch_size,
             "tile_counts": sorted({row["tiles"] for row in instrumented}),
             "num_workers": cli.num_workers,
-            "stages_ms": stages,
-            "sum_mean_stages_1_to_5_ms": sum_1_to_5,
-            "sum_mean_stages_2_to_5_ms": sum_2_to_5,
-            "sum_1_to_5_over_model_total": sum_1_to_5 / model_total,
-            "sum_2_to_5_over_model_total": sum_2_to_5 / model_total,
+            **stage_summary(instrumented, warmup),
             "unchanged_model_total_ms": summary_ms(
                 [row["model_total"] for row in unchanged[warmup:]]
             ),
@@ -393,6 +545,34 @@ def main() -> None:
     )
     del model, loader
     torch.cuda.empty_cache()
+    return image_paths
+
+
+def main() -> None:
+    cli = parse_args()
+    output_dir = Path(cli.output_dir)
+    if cli.merge_variants:
+        merge_variants(output_dir, cli.merge_variants.split(","), cli.category)
+        return
+    if not torch.cuda.is_available():
+        raise RuntimeError("Profiling requires a CUDA GPU.")
+    torch.set_num_threads(cli.num_threads)
+    device = torch.device("cuda:0")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    results_root = Path(cli.results_root)
+    manifest_sha256 = file_sha256(Path(cli.manifest_path))
+    if cli.variant:
+        profile_variant(cli, device, output_dir, results_root, manifest_sha256)
+        return
+    batch_sizes = [int(value) for value in cli.baseline_batch_sizes.split(",")]
+    warmup = cli.warmup_images
+
+    if cli.baselines_only:
+        image_paths = (output_dir / f"images_{cli.category}.txt").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    else:
+        image_paths = profile_ours(cli, device, output_dir, results_root, manifest_sha256)
 
     # SimpleNet and SimpleNet++ baselines on the same images.
     for method, output_name in (("simplenet", "simplenet"), ("simplenet_plus", "simplenet_plus")):
