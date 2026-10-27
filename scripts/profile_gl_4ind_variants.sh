@@ -21,12 +21,12 @@ samples="$profile_dir/gpu${gpu_index}_samples.csv"
 cd "$repo_dir"
 mkdir -p "$profile_dir"
 
-printf 'timestamp,memory.used,utilization.gpu\n' > "$samples"
+printf 'unix_time,memory_used_mib,utilization_percent\n' > "$samples"
 (
     while true; do
-        printf '%s,%s\n' "$(date --iso-8601=seconds)" \
+        printf '%s,%s\n' "$(date +%s)" \
             "$(nvidia-smi -i "$gpu_index" --query-gpu=memory.used,utilization.gpu \
-                --format=csv,noheader 2>&1)" >> "$samples"
+                --format=csv,noheader,nounits 2>&1 | tr -d ' ')" >> "$samples"
         sleep 15
     done
 ) &

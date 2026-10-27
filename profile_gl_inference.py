@@ -110,7 +110,8 @@ def host_load() -> Dict[str, object]:
         capture_output=True,
         text=True,
     )
-    nproc = subprocess.run(["nproc"], capture_output=True, text=True)
+    # Plain nproc returns OMP_NUM_THREADS when it is set; --all gives the core count.
+    nproc = subprocess.run(["nproc", "--all"], capture_output=True, text=True)
     return {
         "unix_time": time.time(),
         "loadavg": Path("/proc/loadavg").read_text(encoding="utf-8").strip(),
