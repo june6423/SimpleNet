@@ -26,7 +26,8 @@ off and on, and ``--merge-s4fix`` writes ``s4fix_<category>.json``.
 ``--s4-mode`` and ``--s4-fp16`` set ``feature_interpolation_mode`` and
 ``feature_interpolation_fp16`` on the model instance.  ``--interp-tensor-check``
 compares the ``_embed`` output of the three modes, and ``--merge-interp``
-writes ``interp_<category>.json``.
+writes ``interp_<category>.json``.  ``--merge-deglad-s`` writes
+``deglad_s_<category>.json`` with the speed-up of each (standard, DeGLAD-S) pair.
 """
 
 from __future__ import annotations
@@ -141,6 +142,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-interp",
         help="Comma-separated substage variant names.  The first one is the reference.",
+    )
+    parser.add_argument(
+        "--merge-deglad-s",
+        help="Comma-separated substage variant names in (standard, DeGLAD-S) pairs.  "
+        "The first one is the reference.",
     )
     return parser.parse_args()
 
@@ -658,6 +664,29 @@ def merge_s4fix(output_dir: Path, names: List[str], category: str, prefix: str =
     )
 
 
+def merge_deglad_s(output_dir: Path, names: List[str], category: str) -> None:
+    """``merge_s4fix`` into deglad_s_<category>.json, plus the speed-up of each pair.
+
+    ``names`` alternates standard and DeGLAD-S runs; each pair ratio is the mean
+    model_total of the standard run over that of the DeGLAD-S run after it.
+    """
+    merge_s4fix(output_dir, names, category, prefix="deglad_s")
+    path = output_dir / f"deglad_s_{category}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    configurations = data["configurations"]
+    for run in configurations.values():
+        run[f"speedup_model_total_vs_{names[0]}"] = run["against_reference"]["speedup_model_total"]
+
+    def mean_model_total(name):
+        return configurations[name]["stages_ms"]["model_total"]["mean"]
+
+    data["pair_speedups"] = {
+        f"{standard}/{deglad_s}": mean_model_total(standard) / mean_model_total(deglad_s)
+        for standard, deglad_s in zip(names[0::2], names[1::2])
+    }
+    write_json(path, data)
+
+
 @torch.inference_mode()
 def tensor_check(cli, device: torch.device, output_dir: Path, results_root: Path,
                  manifest_sha256: str, images: int = 3) -> None:
@@ -1074,6 +1103,9 @@ def main() -> None:
         return
     if cli.merge_interp:
         merge_s4fix(output_dir, cli.merge_interp.split(","), cli.category, prefix="interp")
+        return
+    if cli.merge_deglad_s:
+        merge_deglad_s(output_dir, cli.merge_deglad_s.split(","), cli.category)
         return
     if not torch.cuda.is_available():
         raise RuntimeError("Profiling requires a CUDA GPU.")
