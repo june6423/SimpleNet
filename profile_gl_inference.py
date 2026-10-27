@@ -17,6 +17,11 @@ wrapper of ``patch_maker.patchify``), writes ``substages/NAME.json``, and
 writes the top CUDA kernels of a ``torch.profiler`` pass to
 ``torch_profiler_NAME_top30.txt``.  ``--merge-substages`` writes
 ``substages_<category>.json``.
+
+``--fast-interp`` sets ``fast_feature_interpolation`` of ``simplenet.SimpleNet``
+on the model instance.  ``--tensor-check`` compares the ``_embed`` output with
+the flag off and on, ``--s4fix-baselines`` profiles the baselines with the flag
+off and on, and ``--merge-s4fix`` writes ``s4fix_<category>.json``.
 """
 
 from __future__ import annotations
@@ -93,9 +98,27 @@ def parse_args() -> argparse.Namespace:
         "--substages", action="store_true",
         help="With --variant, time the sub-stages S1 to S8 and run torch.profiler.",
     )
-    parser.add_argument("--profiler-images", type=int, default=3)
+    parser.add_argument(
+        "--profiler-images", type=int, default=3, help="0 skips the torch.profiler pass."
+    )
     parser.add_argument(
         "--merge-substages",
+        help="Comma-separated substage variant names.  The first one is the reference.",
+    )
+    parser.add_argument(
+        "--fast-interp", action="store_true",
+        help="With --variant, set fast_feature_interpolation on the model instance.",
+    )
+    parser.add_argument(
+        "--tensor-check", action="store_true",
+        help="Compare the _embed output with the flag off and on; write s4fix_tensor_check.json.",
+    )
+    parser.add_argument(
+        "--s4fix-baselines", action="store_true",
+        help="Profile the baselines at batch size 1 with the flag off and on.",
+    )
+    parser.add_argument(
+        "--merge-s4fix",
         help="Comma-separated substage variant names.  The first one is the reference.",
     )
     return parser.parse_args()
@@ -451,6 +474,7 @@ def run_baseline(model, loader, device: torch.device) -> List[Dict[str, float]]:
             {
                 "first_index": first_index,
                 "images": len(scores),
+                "scores": [float(score) for score in scores],
                 "loader": timed_loader.waits[-1],
                 "model_total": model_seconds,
                 "end_to_end": now - last,
@@ -576,6 +600,167 @@ def merge_substages(output_dir: Path, names: List[str], category: str) -> None:
     )
 
 
+def merge_s4fix(output_dir: Path, names: List[str], category: str) -> None:
+    """Compare each configuration with the first one; write s4fix_<category>.json."""
+    configurations = {
+        name: json.loads((output_dir / "substages" / f"{name}.json").read_text(encoding="utf-8"))
+        for name in names
+    }
+    reference = configurations[names[0]]
+    reference_scores = np.asarray(reference["scores"])
+    for data in configurations.values():
+        scores = np.asarray(data["scores"])
+        data["against_reference"] = {
+            "reference": names[0],
+            "max_abs_score_diff": float(np.max(np.abs(scores - reference_scores))),
+            "pearson": float(stats.pearsonr(reference_scores, scores)[0]),
+            "spearman": float(stats.spearmanr(reference_scores, scores)[0]),
+            "speedup_model_total": (
+                reference["stages_ms"]["model_total"]["mean"]
+                / data["stages_ms"]["model_total"]["mean"]
+            ),
+            "speedup_local_backbone_heads": (
+                reference["stages_ms"]["local_backbone_heads"]["mean"]
+                / data["stages_ms"]["local_backbone_heads"]["mean"]
+            ),
+            "speedup_substages": {
+                name: reference["substages_ms"][name]["mean"] / data["substages_ms"][name]["mean"]
+                for name in SUBSTAGES
+            },
+        }
+    write_json(
+        output_dir / f"s4fix_{category}.json",
+        {"category": category, "reference": names[0], "configurations": configurations},
+    )
+
+
+@torch.inference_mode()
+def tensor_check(cli, device: torch.device, output_dir: Path, results_root: Path,
+                 manifest_sha256: str, images: int = 3) -> None:
+    """Run ``_embed`` in fp32 on the first tile batch of measured images, flag off and on.
+
+    The layer2 ``patchify`` output, which the flag does not touch, is the control.
+    """
+    args, job_dir, job_result = job_args(
+        results_root, "global_local", cli.category, cli.data_root, cli.manifest_path
+    )
+    if job_result["manifest_sha256"] != manifest_sha256:
+        raise ValueError("The manifest differs from the one in job_result.json.")
+    model, dataset, checkpoint = load_job(args, job_dir, cli.image_count, device)
+    write_or_check_images(
+        output_dir / f"images_{cli.category}.txt",
+        [record.image_path for record in dataset.records],
+    )
+    model._set_inference_mode()
+    checks = []
+    for index in range(cli.warmup_images, cli.warmup_images + images):
+        tile_batch = dataset[index]["local_tiles"][: model.tile_batch_size]
+        # The upload and normalization of timed_predict_highres_item.
+        if tile_batch.dtype == torch.uint8:
+            tile_batch = tile_batch.to(device, dtype=torch.float32).div_(255.0)
+            mean = tile_batch.new_tensor((0.485, 0.456, 0.406))[None, :, None, None]
+            std = tile_batch.new_tensor((0.229, 0.224, 0.225))[None, :, None, None]
+            tile_batch = (tile_batch - mean) / std
+        embedded = {}
+        layer2 = {}
+        for fast in (False, True):
+            model.fast_feature_interpolation = fast
+            embedded[fast], _ = model._embed(
+                tile_batch, provide_patch_shapes=True, evaluation=True
+            )
+            features = model.forward_modules["feature_aggregator"](tile_batch)
+            layer2[fast] = model.patch_maker.patchify(features["layer2"])
+        model.fast_feature_interpolation = False
+        checks.append(
+            {
+                "image_index": index,
+                "image_path": dataset.records[index].image_path,
+                "tiles": int(tile_batch.shape[0]),
+                "embed_dtype": str(embedded[False].dtype),
+                "embed_shape_old": list(embedded[False].shape),
+                "embed_shape_fast": list(embedded[True].shape),
+                "embed_max_abs_diff": float((embedded[True] - embedded[False]).abs().max()),
+                "patchify_layer2_shape_old": list(layer2[False].shape),
+                "patchify_layer2_shape_fast": list(layer2[True].shape),
+                "patchify_layer2_max_abs_diff": float(
+                    (layer2[True] - layer2[False]).abs().max()
+                ),
+            }
+        )
+    write_json(
+        output_dir / "s4fix_tensor_check.json",
+        {
+            "category": cli.category,
+            "checkpoint": str(checkpoint),
+            **environment(device),
+            "checks": checks,
+            "max_embed_abs_diff": max(check["embed_max_abs_diff"] for check in checks),
+            "max_patchify_layer2_abs_diff": max(
+                check["patchify_layer2_max_abs_diff"] for check in checks
+            ),
+        },
+    )
+    del model
+    torch.cuda.empty_cache()
+
+
+def profile_baselines_s4fix(cli, device: torch.device, output_dir: Path, results_root: Path,
+                            manifest_sha256: str) -> None:
+    """Profile each baseline at batch size 1 with the flag off and then on (fp32)."""
+    warmup = cli.warmup_images
+    image_paths = (output_dir / f"images_{cli.category}.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    for method in ("simplenet", "simplenet_plus"):
+        args, job_dir, job_result = job_args(
+            results_root, method, cli.category, cli.data_root, cli.manifest_path
+        )
+        if job_result["manifest_sha256"] != manifest_sha256:
+            raise ValueError(f"The manifest of {method} differs from job_result.json.")
+        model, dataset, checkpoint = load_job(args, job_dir, cli.image_count, device)
+        if [record.image_path for record in dataset.records] != image_paths:
+            raise ValueError(f"The {method} images differ from the global-local images.")
+        by_flag = {}
+        load_start = host_load()
+        for fast in (False, True):
+            model.fast_feature_interpolation = fast
+            loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
+            rows = run_baseline(model, loader, device)
+            measured = rows[warmup:]
+            by_flag[f"fast_{str(fast).lower()}"] = {
+                "model_total_ms": summary_ms([row["model_total"] for row in measured]),
+                "end_to_end_ms": summary_ms([row["end_to_end"] for row in measured]),
+                "scores": [score for row in rows for score in row["scores"]],
+                "per_image_seconds": rows,
+            }
+            del loader
+        load_end = host_load()
+        scores_off = np.asarray(by_flag["fast_false"]["scores"])
+        scores_on = np.asarray(by_flag["fast_true"]["scores"])
+        write_json(
+            output_dir / f"{method}_s4fix_{cli.category}.json",
+            {
+                "method": method,
+                "category": cli.category,
+                "checkpoint": str(checkpoint),
+                "manifest_sha256": manifest_sha256,
+                **environment(device),
+                "model_class": f"{type(model).__module__}.{type(model).__name__}",
+                # The flag changes _embed only where the class defines it (simplenet.SimpleNet).
+                "class_defines_flag": hasattr(type(model), "fast_feature_interpolation"),
+                "image_count": len(dataset.records),
+                "warmup_images": warmup,
+                "batch_size": 1,
+                "max_abs_score_diff": float(np.max(np.abs(scores_on - scores_off))),
+                "host_load_start": load_start,
+                "host_load_end": load_end,
+                **by_flag,
+            },
+        )
+        del model
+        torch.cuda.empty_cache()
+
+
 def write_or_check_images(path: Path, image_paths: List[str]) -> None:
     """Write the image list, or check it against the list that is already there."""
     if path.exists():
@@ -602,6 +787,8 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
         output_dir / f"images_{cli.category}.txt",
         [record.image_path for record in dataset.records],
     )
+    if cli.fast_interp:
+        model.fast_feature_interpolation = True
     if cli.channels_last:
         model.backbone.to(memory_format=torch.channels_last)
     loader = build_loader(dataset, 1, cli.num_workers, shuffle=False)
@@ -626,9 +813,10 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
             "profiler_images": cli.profiler_images,
         }
         # The peak memory below then also covers the profiler pass.
-        write_profiler_top30(
-            model, dataset, cli, output_dir / f"torch_profiler_{cli.variant}_top30.txt"
-        )
+        if cli.profiler_images:
+            write_profiler_top30(
+                model, dataset, cli, output_dir / f"torch_profiler_{cli.variant}_top30.txt"
+            )
     variants_dir = output_dir / ("substages" if cli.substages else "variants")
     variants_dir.mkdir(exist_ok=True)
     write_json(
@@ -637,6 +825,7 @@ def profile_variant(cli, device: torch.device, output_dir: Path, results_root: P
             "variant": cli.variant,
             "autocast_fp16": cli.autocast,
             "channels_last": cli.channels_last,
+            "fast_feature_interpolation": model.fast_feature_interpolation,
             "tile_batch_size": model.tile_batch_size,
             "tile_stride": [args.tile_stride_y, args.tile_stride_x],
             "tile_counts": sorted({row["tiles"] for row in rows}),
@@ -763,6 +952,9 @@ def main() -> None:
     if cli.merge_substages:
         merge_substages(output_dir, cli.merge_substages.split(","), cli.category)
         return
+    if cli.merge_s4fix:
+        merge_s4fix(output_dir, cli.merge_s4fix.split(","), cli.category)
+        return
     if not torch.cuda.is_available():
         raise RuntimeError("Profiling requires a CUDA GPU.")
     torch.set_num_threads(cli.num_threads)
@@ -772,6 +964,12 @@ def main() -> None:
     manifest_sha256 = file_sha256(Path(cli.manifest_path))
     if cli.variant:
         profile_variant(cli, device, output_dir, results_root, manifest_sha256)
+        return
+    if cli.tensor_check:
+        tensor_check(cli, device, output_dir, results_root, manifest_sha256)
+        return
+    if cli.s4fix_baselines:
+        profile_baselines_s4fix(cli, device, output_dir, results_root, manifest_sha256)
         return
     batch_sizes = [int(value) for value in cli.baseline_batch_sizes.split(",")]
     warmup = cli.warmup_images
