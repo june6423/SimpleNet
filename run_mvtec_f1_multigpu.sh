@@ -5,12 +5,20 @@
 # Host usage:
 #   ./run_mvtec_f1_multigpu.sh MVTEC_ROOT RESULTS_ROOT GPU_IDS [JOBS_PER_GPU]
 #   e.g. ./run_mvtec_f1_multigpu.sh /home/vision/dongjun/mvtec-anomaly \
-#            /home/vision/dongjun/SimpleNet/mvtec_f1_results 4,5,6,7 2
+#            /home/vision/dongjun/SimpleNet/mvtec_f1_results 4,5,6,7 4
 #
-# The host side only starts one docker container (image simplenet-a6000:wandb)
-# which re-executes this script with MVTEC_F1_INSIDE=1 to schedule the jobs.
+# The host side runs the scheduler inside the persistent container
+# SIMPLENET_CONTAINER (default SimpleNet-A6000, see docker-compose.yml) with
+# `docker exec`, translating host paths through that container's bind mounts.
+# If that container is not running it falls back to a temporary
+# `docker run --rm` of SIMPLENET_IMAGE.  Either way this script re-executes
+# itself with MVTEC_F1_INSIDE=1 to schedule the jobs.
 # A job whose results.csv already exists is skipped, so the launcher can be
 # re-run after an interruption.
+#
+# Each job is limited to MVTEC_THREADS CPU threads (default 4).  Without this
+# every process spawns one thread per core and 16+ concurrent jobs saturate
+# the CPU while the GPUs idle.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +34,18 @@ GAN_EPOCHS="${MVTEC_GAN_EPOCHS:-4}"
 SEED="${MVTEC_SEED:-0}"
 AUG_SIMPLENET="${MVTEC_AUG_SIMPLENET:-0.0}"
 AUG_PLUS="${MVTEC_AUG_PLUS:-0.1}"
+THREADS="${MVTEC_THREADS:-4}"
 IMAGE="${SIMPLENET_IMAGE:-simplenet-a6000:wandb}"
+CONTAINER="${SIMPLENET_CONTAINER:-SimpleNet-A6000}"
+
+# Map a host path to its path inside a running container via its bind mounts.
+container_path() {
+    local container="$1" host_path="$2" src dst
+    while read -r src dst; do
+        [[ -n "$src" && "$host_path" == "$src"* ]] && { printf '%s%s\n' "$dst" "${host_path#"$src"}"; return 0; }
+    done < <(docker inspect -f '{{range .Mounts}}{{.Source}} {{.Destination}}{{"\n"}}{{end}}' "$container")
+    return 1
+}
 
 # ---------------------------------------------------------------- host side
 if [[ "${MVTEC_F1_INSIDE:-0}" != "1" ]]; then
@@ -37,25 +56,41 @@ if [[ "${MVTEC_F1_INSIDE:-0}" != "1" ]]; then
     mvtec_root="$(cd "$1" && pwd)"
     results_root="$2"
     gpu_ids="$3"
-    jobs_per_gpu="${4:-2}"
+    jobs_per_gpu="${4:-4}"
     mkdir -p "$results_root"
     results_root="$(cd "$results_root" && pwd)"
+    env_args=(
+        --env MVTEC_F1_INSIDE=1
+        --env MVTEC_GPUS="$gpu_ids"
+        --env MVTEC_JOBS_PER_GPU="$jobs_per_gpu"
+        --env MVTEC_METHODS="${METHODS[*]}"
+        --env MVTEC_CATEGORIES="${CATEGORIES[*]}"
+        --env MVTEC_RESIZE="$RESIZE" --env MVTEC_IMAGESIZE="$IMAGESIZE"
+        --env MVTEC_META_EPOCHS="$META_EPOCHS" --env MVTEC_GAN_EPOCHS="$GAN_EPOCHS"
+        --env MVTEC_SEED="$SEED" --env MVTEC_THREADS="$THREADS"
+        --env MVTEC_AUG_SIMPLENET="$AUG_SIMPLENET" --env MVTEC_AUG_PLUS="$AUG_PLUS"
+        --env WANDB_MODE=disabled --env PYTHONUNBUFFERED=1
+    )
+    if docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true; then
+        c_script="$(container_path "$CONTAINER" "$script_dir/run_mvtec_f1_multigpu.sh")" \
+            || { printf 'Repository %s is not mounted in container %s\n' "$script_dir" "$CONTAINER" >&2; exit 2; }
+        c_data="$(container_path "$CONTAINER" "$mvtec_root")" \
+            || { printf 'Dataset %s is not mounted in container %s\n' "$mvtec_root" "$CONTAINER" >&2; exit 2; }
+        c_results="$(container_path "$CONTAINER" "$results_root")" \
+            || { printf 'Results %s is not mounted in container %s\n' "$results_root" "$CONTAINER" >&2; exit 2; }
+        printf 'Using persistent container %s\n' "$CONTAINER"
+        exec docker exec "${env_args[@]}" \
+            --env MVTEC_DATA_ROOT="$c_data" --env MVTEC_RESULTS_ROOT="$c_results" \
+            --workdir "$(dirname "$c_script")" "$CONTAINER" bash "$c_script"
+    fi
+    printf 'Container %s is not running; using a temporary container from %s\n' "$CONTAINER" "$IMAGE"
     model_cache="${SIMPLENET_MODEL_CACHE:-${HOME}/.cache/simplenet/torch}"
     mkdir -p "$model_cache"
     exec docker run --rm --init \
         --name "${SIMPLENET_CONTAINER_NAME:-simplenet-mvtec-f1}" \
         --gpus all --shm-size "${SIMPLENET_SHM_SIZE:-32g}" \
         --workdir /workspace/SimpleNet \
-        --env MVTEC_F1_INSIDE=1 \
-        --env MVTEC_GPUS="$gpu_ids" \
-        --env MVTEC_JOBS_PER_GPU="$jobs_per_gpu" \
-        --env MVTEC_METHODS="${METHODS[*]}" \
-        --env MVTEC_CATEGORIES="${CATEGORIES[*]}" \
-        --env MVTEC_RESIZE="$RESIZE" --env MVTEC_IMAGESIZE="$IMAGESIZE" \
-        --env MVTEC_META_EPOCHS="$META_EPOCHS" --env MVTEC_GAN_EPOCHS="$GAN_EPOCHS" \
-        --env MVTEC_SEED="$SEED" \
-        --env MVTEC_AUG_SIMPLENET="$AUG_SIMPLENET" --env MVTEC_AUG_PLUS="$AUG_PLUS" \
-        --env WANDB_MODE=disabled --env PYTHONUNBUFFERED=1 \
+        "${env_args[@]}" \
         --volume "${script_dir}:/workspace/SimpleNet:rw" \
         --volume "${mvtec_root}:/data/mvtec:ro" \
         --volume "${results_root}:/results:rw" \
@@ -64,10 +99,11 @@ if [[ "${MVTEC_F1_INSIDE:-0}" != "1" ]]; then
 fi
 
 # ------------------------------------------------------------ container side
-data_root=/data/mvtec
-results_root=/results
+data_root="${MVTEC_DATA_ROOT:-/data/mvtec}"
+results_root="${MVTEC_RESULTS_ROOT:-/results}"
 IFS=',' read -r -a gpus <<< "$MVTEC_GPUS"
-jobs_per_gpu="${MVTEC_JOBS_PER_GPU:-2}"
+jobs_per_gpu="${MVTEC_JOBS_PER_GPU:-4}"
+export OMP_NUM_THREADS="$THREADS" MKL_NUM_THREADS="$THREADS" OPENBLAS_NUM_THREADS="$THREADS"
 mkdir -p "$results_root/logs"
 
 run_job() {
@@ -125,8 +161,8 @@ for category in "${CATEGORIES[@]}"; do
     done
 done
 slots=$(( ${#gpus[@]} * jobs_per_gpu ))
-printf 'MVTEC_F1 jobs=%d gpus=%s jobs_per_gpu=%s slots=%d start=%s\n' \
-    "${#jobs[@]}" "$MVTEC_GPUS" "$jobs_per_gpu" "$slots" "$(date --iso-8601=seconds)"
+printf 'MVTEC_F1 jobs=%d gpus=%s jobs_per_gpu=%s slots=%d threads=%s data=%s results=%s start=%s\n' \
+    "${#jobs[@]}" "$MVTEC_GPUS" "$jobs_per_gpu" "$slots" "$THREADS" "$data_root" "$results_root" "$(date --iso-8601=seconds)"
 
 worker() {
     local slot="$1" gpu="$2" failures=0
