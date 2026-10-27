@@ -34,7 +34,24 @@ AUG_PLUS="${VISA_AUG_PLUS:-0.1}"
 # THREADS_PER_JOB OpenMP/MKL threads and NUM_WORKERS loader workers.
 THREADS_PER_JOB="${VISA_THREADS_PER_JOB:-4}"
 NUM_WORKERS="${VISA_NUM_WORKERS:-4}"
+# crop: datasets/visa_mvtecstyle.py (Resize(RESIZE), CenterCrop(IMAGESIZE)).
+# letterbox: datasets/visa_legacy.py (whole image letterboxed to IMAGESIZE);
+# it needs PIXEL_MODE (original-hist or letterbox-exact, see
+# visa_letterbox_f1_eval.py).
+LOADER="${VISA_LOADER:-crop}"
+PIXEL_MODE="${VISA_PIXEL_MODE:-}"
 IMAGE="${SIMPLENET_IMAGE:-simplenet-a6000:wandb}"
+case "$LOADER" in
+    crop) DATASET_NAME=visa ;;
+    letterbox)
+        DATASET_NAME=visa_letterbox
+        if [[ -z "$PIXEL_MODE" ]]; then
+            printf 'VISA_LOADER=letterbox needs VISA_PIXEL_MODE.\n' >&2
+            exit 2
+        fi
+        ;;
+    *) printf 'Invalid VISA_LOADER: %s\n' "$LOADER" >&2; exit 2 ;;
+esac
 
 # ---------------------------------------------------------------- host side
 if [[ "${VISA_F1_INSIDE:-0}" != "1" ]]; then
@@ -64,6 +81,7 @@ if [[ "${VISA_F1_INSIDE:-0}" != "1" ]]; then
         --env VISA_SEED="$SEED" \
         --env VISA_AUG_SIMPLENET="$AUG_SIMPLENET" --env VISA_AUG_PLUS="$AUG_PLUS" \
         --env VISA_THREADS_PER_JOB="$THREADS_PER_JOB" --env VISA_NUM_WORKERS="$NUM_WORKERS" \
+        --env VISA_LOADER="$LOADER" --env VISA_PIXEL_MODE="$PIXEL_MODE" \
         --env WANDB_MODE=disabled --env PYTHONUNBUFFERED=1 \
         --volume "${script_dir}:/workspace/SimpleNet:rw" \
         --volume "${visa_root}:/data/visa:ro" \
@@ -91,7 +109,7 @@ run_job() {
         aug_flags=(--augment --brightness "$aug" --contrast "$aug" --saturation "$aug")
     fi
 
-    if [[ -f "$out/results.csv" && -f "$out/models/0/visa_${category}/ckpt.pth" ]]; then
+    if [[ -f "$out/results.csv" && -f "$out/models/0/${DATASET_NAME}_${category}/ckpt.pth" ]]; then
         printf 'SKIP_TRAIN gpu=%s %s/%s\n' "$gpu" "$method" "$category"
     else
         printf 'START gpu=%s %s/%s %s\n' "$gpu" "$method" "$category" "$(date --iso-8601=seconds)"
@@ -107,7 +125,7 @@ run_job() {
             --dsc_layers 2 --dsc_margin .5 --pre_proj 1 \
             dataset --batch_size 8 --num_workers "$NUM_WORKERS" \
             --resize "$RESIZE" --imagesize "$IMAGESIZE" \
-            "${aug_flags[@]}" -d "$category" visa "$data_root" > "$log" 2>&1; then
+            "${aug_flags[@]}" -d "$category" "$DATASET_NAME" "$data_root" > "$log" 2>&1; then
             printf 'TRAIN_FAILED gpu=%s %s/%s log=%s\n' "$gpu" "$method" "$category" "$log"
             return 1
         fi
@@ -118,9 +136,13 @@ run_job() {
         printf 'SKIP_EVAL %s/%s\n' "$method" "$category"
         return 0
     fi
-    if ! python3 visa_f1_eval.py eval --method "$method" --category "$category" \
+    local eval_cmd=(visa_f1_eval.py eval --resize "$RESIZE")
+    if [[ "$LOADER" == "letterbox" ]]; then
+        eval_cmd=(visa_letterbox_f1_eval.py --pixel-mode "$PIXEL_MODE")
+    fi
+    if ! python3 "${eval_cmd[@]}" --method "$method" --category "$category" \
         --results-root "$results_root" --data-root "$data_root" --gpu "$gpu" \
-        --resize "$RESIZE" --imagesize "$IMAGESIZE" \
+        --imagesize "$IMAGESIZE" \
         --meta-epochs "$META_EPOCHS" --gan-epochs "$GAN_EPOCHS" --seed "$SEED" >> "$log" 2>&1; then
         printf 'EVAL_FAILED %s/%s log=%s\n' "$method" "$category" "$log"
         return 1
@@ -136,9 +158,9 @@ for category in "${CATEGORIES[@]}"; do
     done
 done
 slots=$(( ${#gpus[@]} * jobs_per_gpu ))
-printf 'VISA_F1 jobs=%d gpus=%s jobs_per_gpu=%s slots=%d threads_per_job=%s num_workers=%s start=%s\n' \
+printf 'VISA_F1 jobs=%d gpus=%s jobs_per_gpu=%s slots=%d threads_per_job=%s num_workers=%s loader=%s imagesize=%s pixel_mode=%s start=%s\n' \
     "${#jobs[@]}" "$VISA_GPUS" "$jobs_per_gpu" "$slots" "$THREADS_PER_JOB" "$NUM_WORKERS" \
-    "$(date --iso-8601=seconds)"
+    "$LOADER" "$IMAGESIZE" "${PIXEL_MODE:-NONE}" "$(date --iso-8601=seconds)"
 
 worker() {
     local slot="$1" gpu="$2" failures=0

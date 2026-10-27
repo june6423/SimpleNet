@@ -28,6 +28,7 @@ _DATASETS = {
     "etri": ["datasets.etri", "EtriDataset"],
     "etri_printing": ["datasets.etri_printing", "EtriPrintingDataset"],
     "visa": ["datasets.visa_mvtecstyle", "VisAMVTecStyleDataset"],
+    "visa_letterbox": ["datasets.visa_legacy", "VisALegacyDataset"],
 }
 
 
